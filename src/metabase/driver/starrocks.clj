@@ -40,7 +40,10 @@
                               :nested-field-columns            false
                               :connection/multiple-databases   true
                               :metadata/key-constraints        false
-                              :now                             true}]
+                              :now                             true
+                              :temporal-extract                true
+                              :date-arithmetics                true
+                              :advanced-math-expressions       true}]
   (defmethod driver/database-supports? [:starrocks feature] [_ _ _] supported?))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -104,29 +107,29 @@
 (def ^:private starrocks-type->base-type
   "Map of StarRocks types to Metabase base types."
   (sql-jdbc.sync/pattern-based-database-type->base-type
-   [[#"(?i)boolean"                    :type/Boolean]
-    [#"(?i)tinyint"                    :type/Integer]
-    [#"(?i)smallint"                   :type/Integer]
-    [#"(?i)int"                        :type/Integer]
-    [#"(?i)bigint"                     :type/BigInteger]
-    [#"(?i)largeint"                   :type/BigInteger]
-    [#"(?i)float"                      :type/Float]
-    [#"(?i)double"                     :type/Float]
-    [#"(?i)decimal.*"                  :type/Decimal]
-    [#"(?i)varchar.*"                  :type/Text]
-    [#"(?i)char.*"                     :type/Text]
-    [#"(?i)string"                     :type/Text]
-    [#"(?i)text"                       :type/Text]
-    [#"(?i)json"                       :type/JSON]
-    [#"(?i)date"                       :type/Date]
-    [#"(?i)datetime"                   :type/DateTime]
-    [#"(?i)timestamp"                  :type/DateTime]
-    [#"(?i)array.*"                    :type/Array]
-    [#"(?i)map.*"                      :type/Dictionary]
-    [#"(?i)struct.*"                   :type/*]
-    [#"(?i)bitmap"                     :type/*]
-    [#"(?i)hll"                        :type/*]
-    [#"(?i)percentile"                 :type/*]
+   [[#"(?i)^boolean$"                  :type/Boolean]
+    [#"(?i)^tinyint$"                  :type/Integer]
+    [#"(?i)^smallint$"                 :type/Integer]
+    [#"(?i)^int$"                      :type/Integer]
+    [#"(?i)^bigint$"                   :type/BigInteger]
+    [#"(?i)^largeint$"                 :type/BigInteger]
+    [#"(?i)^float$"                    :type/Float]
+    [#"(?i)^double$"                   :type/Float]
+    [#"(?i)^decimal.*"                 :type/Decimal]
+    [#"(?i)^varchar.*"                 :type/Text]
+    [#"(?i)^char.*"                    :type/Text]
+    [#"(?i)^string$"                   :type/Text]
+    [#"(?i)^text$"                     :type/Text]
+    [#"(?i)^json$"                     :type/JSON]
+    [#"(?i)^date$"                     :type/Date]
+    [#"(?i)^datetime$"                 :type/DateTime]
+    [#"(?i)^timestamp$"                :type/DateTime]
+    [#"(?i)^array.*"                   :type/Array]
+    [#"(?i)^map.*"                     :type/Dictionary]
+    [#"(?i)^struct.*"                  :type/*]
+    [#"(?i)^bitmap$"                   :type/*]
+    [#"(?i)^hll$"                      :type/*]
+    [#"(?i)^percentile$"               :type/*]
     [#".*"                             :type/*]]))
 
 (defmethod sql-jdbc.sync/database-type->base-type :starrocks
@@ -255,6 +258,89 @@
 (defmethod sql.qp/current-datetime-honeysql-form :starrocks
   [_]
   :%now)
+
+(defmethod sql.qp/date [:starrocks :default] [_ _ expr] expr)
+
+(defmethod sql.qp/date [:starrocks :minute]
+  [_ _ expr]
+  [:date_trunc "minute" expr])
+
+(defmethod sql.qp/date [:starrocks :hour]
+  [_ _ expr]
+  [:date_trunc "hour" expr])
+
+(defmethod sql.qp/date [:starrocks :day]
+  [_ _ expr]
+  [:date_trunc "day" expr])
+
+(defmethod sql.qp/date [:starrocks :week]
+  [_ _ expr]
+  [:date_trunc "week" expr])
+
+(defmethod sql.qp/date [:starrocks :month]
+  [_ _ expr]
+  [:date_trunc "month" expr])
+
+(defmethod sql.qp/date [:starrocks :quarter]
+  [_ _ expr]
+  [:date_trunc "quarter" expr])
+
+(defmethod sql.qp/date [:starrocks :year]
+  [_ _ expr]
+  [:date_trunc "year" expr])
+
+(defmethod sql.qp/date [:starrocks :minute-of-hour] [_ _ expr] [:minute expr])
+(defmethod sql.qp/date [:starrocks :hour-of-day]   [_ _ expr] [:hour expr])
+(defmethod sql.qp/date [:starrocks :day-of-month]  [_ _ expr] [:day expr])
+(defmethod sql.qp/date [:starrocks :month-of-year] [_ _ expr] [:month expr])
+(defmethod sql.qp/date [:starrocks :year-of-era]   [_ _ expr] [:year expr])
+(defmethod sql.qp/date [:starrocks :day-of-week]   [_ _ expr] [:dayofweek expr])
+(defmethod sql.qp/date [:starrocks :week-of-year]  [_ _ expr] [:week expr])
+(defmethod sql.qp/date [:starrocks :quarter-of-year] [_ _ expr] [:quarter expr])
+
+(defmethod sql.qp/add-interval-honeysql-form :starrocks
+  [_ hsql-form amount unit]
+  [:date_add hsql-form [:interval amount (keyword (name unit))]])
+
+(defmethod sql.qp/datetime-diff [:starrocks :year]
+  [_ _ unit x y]
+  [:timestampdiff (keyword (name unit)) x y])
+
+(defmethod sql.qp/datetime-diff [:starrocks :month]
+  [_ _ unit x y]
+  [:timestampdiff (keyword (name unit)) x y])
+
+(defmethod sql.qp/datetime-diff [:starrocks :day]
+  [_ _ unit x y]
+  [:datediff y x])
+
+(defmethod sql.qp/datetime-diff [:starrocks :hour]
+  [_ _ unit x y]
+  [:timestampdiff (keyword (name unit)) x y])
+
+(defmethod sql.qp/datetime-diff [:starrocks :minute]
+  [_ _ unit x y]
+  [:timestampdiff (keyword (name unit)) x y])
+
+(defmethod sql.qp/datetime-diff [:starrocks :second]
+  [_ _ unit x y]
+  [:timestampdiff (keyword (name unit)) x y])
+
+(defmethod sql.qp/cast-temporal-string [:starrocks :Coercion/ISO8601->DateTime]
+  [_ _ expr]
+  [:cast expr :datetime])
+
+(defmethod sql.qp/cast-temporal-string [:starrocks :Coercion/ISO8601->Date]
+  [_ _ expr]
+  [:cast expr :date])
+
+(defmethod sql.qp/cast-temporal-string [:starrocks :Coercion/YYYYMMDDHHMMSSString->Temporal]
+  [_ _ expr]
+  [:cast expr :datetime])
+
+(defmethod sql.qp/cast-temporal-byte [:starrocks :Coercion/YYYYMMDDHHMMSSBytes->Temporal]
+  [_ _ expr]
+  [:cast expr :datetime])
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Driver Metadata                                                        |
