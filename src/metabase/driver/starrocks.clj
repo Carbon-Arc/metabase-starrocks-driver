@@ -41,6 +41,7 @@
                               :connection/multiple-databases   true
                               :metadata/key-constraints        false
                               :now                             true
+                              :datetime-diff                   true
                               :temporal-extract                true
                               :date-arithmetics                true
                               :advanced-math-expressions       true}]
@@ -303,28 +304,28 @@
   [:date_add hsql-form [:interval amount (keyword (name unit))]])
 
 (defmethod sql.qp/datetime-diff [:starrocks :year]
-  [_ _ unit x y]
-  [:timestampdiff (keyword (name unit)) x y])
+  [_ unit x y]
+  [:timestampdiff [:raw (name unit)] x y])
 
 (defmethod sql.qp/datetime-diff [:starrocks :month]
-  [_ _ unit x y]
-  [:timestampdiff (keyword (name unit)) x y])
+  [_ unit x y]
+  [:timestampdiff [:raw (name unit)] x y])
 
 (defmethod sql.qp/datetime-diff [:starrocks :day]
-  [_ _ unit x y]
+  [_ unit x y]
   [:datediff y x])
 
 (defmethod sql.qp/datetime-diff [:starrocks :hour]
-  [_ _ unit x y]
-  [:timestampdiff (keyword (name unit)) x y])
+  [_ unit x y]
+  [:timestampdiff [:raw (name unit)] x y])
 
 (defmethod sql.qp/datetime-diff [:starrocks :minute]
-  [_ _ unit x y]
-  [:timestampdiff (keyword (name unit)) x y])
+  [_ unit x y]
+  [:timestampdiff [:raw (name unit)] x y])
 
 (defmethod sql.qp/datetime-diff [:starrocks :second]
-  [_ _ unit x y]
-  [:timestampdiff (keyword (name unit)) x y])
+  [_ unit x y]
+  [:timestampdiff [:raw (name unit)] x y])
 
 (defmethod sql.qp/cast-temporal-string [:starrocks :Coercion/ISO8601->DateTime]
   [_ _ expr]
