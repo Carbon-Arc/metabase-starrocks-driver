@@ -17,7 +17,11 @@
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.util.log :as log])
   (:import
-   (java.sql Connection ResultSet)))
+   (java.io ByteArrayInputStream FileOutputStream)
+   (java.security KeyStore)
+   (java.security.cert Certificate CertificateFactory)
+   (java.sql Connection ResultSet)
+   (java.util Base64)))
 
 (set! *warn-on-reflection* true)
 
@@ -51,8 +55,123 @@
 ;;; |                                          Connection Details                                                     |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
+(defn- additional-options->map
+  "Parse `additional-options` string (`key=value&...`) into a map with string keys."
+  [additional-options]
+  (when (and additional-options (not (str/blank? additional-options)))
+    (into {}
+          (for [pair (str/split additional-options #"&")
+                :let [pair (str/trim pair)]
+                :when (not (str/blank? pair))]
+            (let [[k v] (str/split pair #"=" 2)]
+              [(str/trim k) (or v "")])))))
+
+(def ^:private ssl-jdbc-property-keys
+  "JDBC properties that only apply when the user enables SSL in the connection form."
+  #{:useSSL :sslMode :requireSSL :verifyServerCertificate :trustServerCertificate
+    :trustCertificateKeyStoreUrl :trustCertificateKeyStoreType :trustCertificateKeyStorePassword
+    :clientCertificateKeyStoreUrl :clientCertificateKeyStoreType :clientCertificateKeyStorePassword
+    :enabledSslProtocolSuites :enabledSslCipherSuites})
+
+(defn- ssl-enabled?
+  "SSL is opt-in only: controlled by the Metabase \"Use a secure connection (SSL)\" checkbox."
+  [{:keys [ssl]}]
+  (boolean ssl))
+
+(defn- without-ssl-jdbc-keys
+  "Remove SSL-related keys so additional-options cannot enable SSL when the checkbox is off."
+  [opts-map]
+  (into {} (remove (fn [[k _]] (contains? ssl-jdbc-property-keys k)) opts-map)))
+
+(defn- valid-pem?
+  "True when `pem-content` looks like at least one PEM certificate block."
+  [pem-content]
+  (boolean
+   (and (not (str/blank? pem-content))
+        (re-find #"-----BEGIN CERTIFICATE-----" (str pem-content)))))
+
+(defn- parse-pem-certificates
+  "Parse one or more PEM X.509 certificates from `pem-content`."
+  ^"[Ljava.security.cert.Certificate;" [^String pem-content]
+  (let [^CertificateFactory cf (CertificateFactory/getInstance "X.509")
+        blocks                (re-seq #"-----BEGIN CERTIFICATE-----\s*([\s\S]*?)\s*-----END CERTIFICATE-----"
+                                    pem-content)]
+    (into-array Certificate
+                (mapcat (fn [[_b64-body b64-body]]
+                          (let [^String cleaned (str/replace b64-body #"\s" "")
+                                bytes           (.decode (Base64/getDecoder) cleaned)]
+                            (.generateCertificates cf (ByteArrayInputStream. bytes))))
+                        blocks))))
+
+(defn- jks-truststore-file-url
+  "Build a JKS truststore from PEM CA/certificate chain (works on all JDKs; avoids PEM KeyStore type)."
+  [^String pem-content]
+  (let [certs     (parse-pem-certificates pem-content)
+        ^KeyStore ks (KeyStore/getInstance (KeyStore/getDefaultType))]
+    (.load ks nil nil)
+    (dotimes [i (alength certs)]
+      (.setCertificateEntry ks (str "ca-" i) (aget certs i)))
+    (let [^java.io.File f (doto (java.io.File/createTempFile "starrocks-trust-" ".jks")
+                              (.deleteOnExit))]
+      (with-open [^FileOutputStream os (FileOutputStream. f)]
+        (.store ks os (char-array "")))
+      (str "file:" (.getAbsolutePath f)))))
+
+(defn- normalize-ssl-mode
+  "Normalize ssl-mode from the connection form (e.g. verify-identity -> VERIFY_IDENTITY)."
+  [mode]
+  (when-not (str/blank? mode)
+    (-> mode str/trim str/upper-case (str/replace #"-" "_"))))
+
+(defn- ssl-mode-verifies-certificate?
+  [ssl-mode]
+  (boolean (and ssl-mode (re-find #"VERIFY" ssl-mode))))
+
+(defn- default-ssl-mode
+  "Default sslMode when the form field is left empty."
+  [ssl-cert-pem]
+  (if ssl-cert-pem "VERIFY_CA" "VERIFY_IDENTITY"))
+
+(defn- ssl-jdbc-spec
+  "Build JDBC SSL options from the ssl-mode form field and optional PEM trust material.
+   Custom CA PEM is only applied for VERIFY_CA (JKS truststore). VERIFY_IDENTITY uses the JVM trust store
+   and also checks that the certificate hostname matches the connection host."
+  [ssl-cert-pem ssl-mode-from-form]
+  (let [ssl-mode       (or (normalize-ssl-mode ssl-mode-from-form)
+                           (default-ssl-mode ssl-cert-pem))
+        use-custom-ca? (and (= ssl-mode "VERIFY_CA")
+                            (valid-pem? ssl-cert-pem))]
+    (when (and (= ssl-mode "VERIFY_CA") ssl-cert-pem (not (valid-pem? ssl-cert-pem)))
+      (log/warn "StarRocks SSL: ssl-cert is set but does not contain a valid PEM certificate; using JVM truststore only."))
+    (cond-> {:useSSL "true" :sslMode ssl-mode}
+      (= ssl-mode "VERIFY_IDENTITY") (assoc :verifyServerCertificate "true")
+      use-custom-ca?
+      (assoc :trustCertificateKeyStoreType "JKS"
+             :trustCertificateKeyStoreUrl   (jks-truststore-file-url ssl-cert-pem)
+             :trustCertificateKeyStorePassword ""))))
+
+(defn- maybe-log-ssl-hint
+  "Log SSL configuration hints when verification is enabled."
+  [ssl? ssl-cert ssl-mode-from-form additional-options]
+  (when ssl?
+    (let [addl-opts-map   (additional-options->map additional-options)
+          ssl-cert?       (and ssl-cert (not (str/blank? (str ssl-cert))))
+          form-ssl-mode   (normalize-ssl-mode ssl-mode-from-form)
+          addl-ssl-mode   (some-> (get addl-opts-map "sslMode") normalize-ssl-mode)
+          effective-mode  (or addl-ssl-mode form-ssl-mode (default-ssl-mode (when ssl-cert? (str ssl-cert))))]
+      (when (= "false" (get addl-opts-map "verifyServerCertificate"))
+        (log/warn "StarRocks SSL: verifyServerCertificate=false disables certificate validation."))
+      (when (= "REQUIRED" effective-mode)
+        (log/warnf "StarRocks SSL: sslMode=REQUIRED encrypts but does not verify the server certificate."
+                   effective-mode))
+      (when (and (ssl-mode-verifies-certificate? effective-mode)
+                 (not ssl-cert?)
+                 (not (contains? addl-opts-map "trustCertificateKeyStoreUrl")))
+        (log/infof "StarRocks SSL: sslMode=%s with JVM truststore. Paste the server CA PEM chain into 'Server SSL certificate chain' if you see PKIX / certificate_unknown errors."
+                   effective-mode)))))
+
 (defmethod sql-jdbc.conn/connection-details->spec :starrocks
-  [_ {:keys [host port catalog dbname user password additional-options]
+  [_ {:keys [host port catalog dbname user password ssl ssl-mode ssl-cert additional-options]
       :or   {host "localhost"
              port 9030
              catalog "default_catalog"}}]
@@ -62,43 +181,52 @@
         ;; This allows us to connect and then query SHOW DATABASES to list all databases
         catalog-trimmed (when catalog (str/trim catalog))
         dbname-trimmed (when dbname (str/trim dbname))
-        
+
         db-name (cond
                   ;; Both catalog and database provided
-                  (and (not (str/blank? catalog-trimmed)) 
+                  (and (not (str/blank? catalog-trimmed))
                        (not (str/blank? dbname-trimmed)))
                   (str catalog-trimmed "." dbname-trimmed)
-                  
+
                   ;; Only catalog provided - use information_schema as connection target
                   ;; This is a system database that always exists in every catalog
                   (not (str/blank? catalog-trimmed))
                   (str catalog-trimmed ".information_schema")
-                  
+
                   ;; Fallback to default_catalog
                   :else
                   "default_catalog.information_schema")
-        
-        ;; Base JDBC spec using MariaDB driver (MySQL compatible)
-        base-spec {:classname   "org.mariadb.jdbc.Driver"
-                   :subprotocol "mysql"
-                   :subname     (str "//" host ":" port "/" db-name)
-                   :user        user
-                   :password    password
-                   ;; StarRocks-specific settings
-                   :tinyInt1isBit "false"
-                   :yearIsDateType "false"
-                   :serverTimezone "UTC"
-                   :useSSL "false"
-                   :allowPublicKeyRetrieval "true"
-                   :zeroDateTimeBehavior "convertToNull"}]
-    ;; Merge any additional options
-    (if (and additional-options (not (str/blank? additional-options)))
-      (merge base-spec
-             (into {}
-                   (for [pair (str/split additional-options #"&")
-                         :when (not (str/blank? pair))]
-                     (let [[k v] (str/split pair #"=" 2)]
-                       [(keyword k) (or v "")]))))
+
+        ssl?         (ssl-enabled? {:ssl ssl})
+        ssl-cert-pem (when (and ssl? ssl-cert (valid-pem? (str ssl-cert)))
+                       (str/trim (str ssl-cert)))
+
+        _            (maybe-log-ssl-hint ssl? ssl-cert ssl-mode additional-options)
+
+        ;; MySQL Connector/J — SSL with server certificate verification (VERIFY_CA / VERIFY_IDENTITY)
+        base-spec (cond-> {:classname   "com.mysql.cj.jdbc.Driver"
+                           :subprotocol "mysql"
+                           :subname     (str "//" host ":" port "/" db-name)
+                           :user        user
+                           :password    password
+                           ;; StarRocks-specific settings
+                           :tinyInt1isBit "false"
+                           :yearIsDateType "false"
+                           :serverTimezone "UTC"
+                           :allowPublicKeyRetrieval "true"
+                           :zeroDateTimeBehavior "convertToNull"}
+                     (not ssl?) (assoc :useSSL "false")
+                     ssl?       (merge (ssl-jdbc-spec ssl-cert-pem ssl-mode)))
+
+        addl-spec (when-let [opts (additional-options->map additional-options)]
+                    (let [opts+keys (into {}
+                                          (map (fn [[k v]] [(keyword k) v]))
+                                          opts)]
+                      (if ssl?
+                        opts+keys
+                        (without-ssl-jdbc-keys opts+keys))))]
+    (if addl-spec
+      (merge base-spec addl-spec)
       base-spec)))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
@@ -380,7 +508,11 @@
       (jdbc/query spec ["SELECT 1"])
       true)
     (catch Exception e
-      (log/errorf "StarRocks connection failed: %s" (.getMessage e))
+      (let [msg (loop [ex ^Exception e, acc []]
+                  (if ex
+                    (recur (ex-cause ex) (conj acc (.getMessage ex)))
+                    (str/join " -> " (remove str/blank? acc))))]
+        (log/errorf "StarRocks connection failed: %s" msg))
       false)))
 
 (defmethod driver/humanize-connection-error-message :starrocks
@@ -399,6 +531,29 @@
       
       (re-find #"(?i)unknown catalog" msg)
       "Catalog not found. Please check the catalog name."
-      
+
+      (re-find #"(?i)insecure transport" msg)
+      (str msg " — This StarRocks instance requires SSL. Enable \"Use a secure connection (SSL)\" in Metabase.")
+
+      (re-find #"(?i)could not load system variables" msg)
+      (str msg " — JDBC driver could not read MySQL session variables from StarRocks. "
+           "Ensure SSL is enabled if required, then retry.")
+
+      (re-find #"(?i)PKIX|certificate_unknown|certpath|unable to find valid certification path" msg)
+      (str msg " — Certificate verification failed. Use SSL mode VERIFY_CA and paste the FE CA PEM chain, "
+           "or VERIFY_IDENTITY if the CA is in the JVM trust store. Internal hostnames often need VERIFY_CA, not VERIFY_IDENTITY.")
+
+      (re-find #"(?i)hostname.*not match|name mismatch|No subject alternative" msg)
+      (str msg " — Hostname does not match the server certificate. Use SSL mode VERIFY_CA with the CA PEM chain "
+           "(does not require hostname match), or connect using the hostname on the certificate.")
+
+      (re-find #"(?i)PEM KeyStore not available|PEM not found|Failed to create keystore" msg)
+      (str msg " — Invalid or unsupported certificate material. Paste a valid PEM chain (-----BEGIN CERTIFICATE-----) "
+           "and use SSL mode VERIFY_CA.")
+
+      (re-find #"(?i)ssl|tls|handshake" msg)
+      (str msg " — Ensure StarRocks FE has SSL enabled (ssl_keystore_* in fe.conf, v3.4.1+)"
+           " and that \"Use a secure connection (SSL)\" is checked in Metabase.")
+
       :else
       msg)))

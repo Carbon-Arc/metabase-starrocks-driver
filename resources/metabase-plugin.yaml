@@ -1,6 +1,6 @@
 info:
   name: Metabase StarRocks Driver
-  version: 1.0.0
+  version: 1.1.0
   description: StarRocks driver for Metabase with multi-catalog support.
 
 driver:
@@ -26,6 +26,26 @@ driver:
       helper-text: "Specific database within the catalog. Leave empty to see all databases."
     - user
     - password
+    - ssl
+    - name: ssl-mode
+      display-name: SSL mode
+      type: select
+      default: VERIFY_CA
+      helper-text: "VERIFY_CA or VERIFY_IDENTITY validate the server certificate; REQUIRED encrypts only."
+      options:
+        - name: Verify CA (encrypt + verify certificate chain)
+          value: VERIFY_CA
+        - name: Verify identity (encrypt + verify certificate + hostname)
+          value: VERIFY_IDENTITY
+        - name: Required (encrypt only)
+          value: REQUIRED
+      visible-if:
+        ssl: true
+    - name: ssl-cert
+      display-name: Server SSL certificate chain
+      helper-text: "PEM CA or certificate chain. Recommended for VERIFY_CA / private or Aliyun CAs."
+      visible-if:
+        ssl: true
     - ssh-tunnel
     - advanced-options-start
     - merge:
@@ -37,4 +57,4 @@ init:
   - step: load-namespace
     namespace: metabase.driver.starrocks
   - step: register-jdbc-driver
-    class: org.mariadb.jdbc.Driver
+    class: com.mysql.cj.jdbc.Driver

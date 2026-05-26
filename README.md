@@ -76,6 +76,22 @@ Then restart Metabase to load the driver.
 | Database | Database within catalog (optional) | `my_database` |
 | Username | StarRocks user | `admin` |
 | Password | User password | `••••••••` |
+| Use a secure connection (SSL) | Encrypt the MySQL protocol connection | Enabled when FE requires SSL |
+| Server SSL certificate chain | CA / server PEM chain for trust | Required when FE uses a private or self-signed CA |
+
+### SSL
+
+StarRocks supports SSL on the MySQL protocol port (default `9030`) starting from **v3.4.1**. Configure the FE node first — see the [StarRocks SSL documentation](https://docs.starrocks.io/docs/administration/user_privs/ssl_authentication/) (`ssl_keystore_location`, `ssl_keystore_password`, `ssl_key_password` in `fe.conf`).
+
+1. Enable **Use a secure connection (SSL)** in the database connection form (off by default; no SSL settings apply when unchecked).
+2. Choose **SSL mode** (three levels, only shown when SSL is enabled):
+   - **VERIFY_CA** (default): encrypt + verify the certificate chain (paste CA PEM for private / Aliyun CAs).
+   - **VERIFY_IDENTITY**: encrypt + verify certificate and hostname (public CA in JVM trust store).
+   - **REQUIRED**: encrypt only, no certificate validation (only if your security policy allows).
+3. Optionally paste the CA / certificate chain (PEM) into **Server SSL certificate chain**.
+4. **Additional JDBC options** can still override `sslMode` when SSL is enabled. With SSL off, SSL-related keys in additional options are ignored.
+
+> **Note**: StarRocks v3.2+ is required for catalog support; SSL on the MySQL port requires v3.4.1+.
 
 ### Catalog Examples
 
@@ -143,6 +159,13 @@ This triggers a workflow that builds the JAR and creates a GitHub release with t
 - Verify the catalog name is correct
 - Check that the user has `SELECT` privileges on the tables
 - Try leaving the Database field empty to scan all databases
+
+### SSL Connection Failed
+
+- StarRocks FE must have SSL configured in `fe.conf` (requires StarRocks v3.4.1+)
+- Enable **Use a secure connection (SSL)** when the FE requires encrypted connections
+- **PKIX / certificate_unknown**: paste the FE CA or full certificate chain (PEM) into **Server SSL certificate chain**, or import that CA into the Metabase JVM truststore
+- If hostname verification fails with a valid CA, try `sslMode=VERIFY_CA` in additional JDBC options (verifies the chain but is less strict on hostname than `VERIFY_IDENTITY`)
 
 ### Sync Errors
 
