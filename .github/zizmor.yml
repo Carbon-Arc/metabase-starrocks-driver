@@ -1,0 +1,14 @@
+# zizmor configuration — https://docs.zizmor.sh/configuration/
+#
+# Findings are gated by the workflow in .github/workflows/zizmor.yml, which
+# fails the build on any reported finding. Use the `ignore` lists below to
+# document intentional, reviewed exceptions so they don't block PRs.
+
+rules:
+  # `superfluous-actions` suggests replacing softprops/action-gh-release with a
+  # `gh release` script step. We intentionally keep the action: it handles
+  # release-note generation and asset uploads cleanly and is pinned to a commit
+  # SHA. This is a style preference, not a security issue.
+  superfluous-actions:
+    ignore:
+      - release.yml
