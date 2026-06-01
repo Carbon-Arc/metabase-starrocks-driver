@@ -1,0 +1,42 @@
+name: GitHub Actions Security (zizmor)
+
+# Audits the repository's GitHub Actions workflows for security issues
+# (script/template injection, credential persistence, unpinned actions,
+# cache poisoning, etc.) using https://zizmor.sh. Runs on every PR and on
+# pushes to main so untrusted contributions can't introduce workflow
+# vulnerabilities unnoticed. Findings fail the build and are surfaced as
+# inline annotations on the PR diff.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: Audit workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        with:
+          # Surface findings as inline PR annotations and fail the build on any
+          # finding. Annotations mode (instead of advanced-security/SARIF) needs
+          # no `security-events: write`, so it works on pull requests from forks.
+          advanced-security: false
+          annotations: true
