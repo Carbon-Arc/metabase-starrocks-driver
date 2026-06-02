@@ -73,12 +73,6 @@
     :clientCertificateKeyStoreUrl :clientCertificateKeyStoreType :clientCertificateKeyStorePassword
     :enabledSslProtocolSuites :enabledSslCipherSuites})
 
-(def ^:private ssl-jdbc-truststore-keys
-  #{:trustCertificateKeyStoreUrl :trustCertificateKeyStoreType :trustCertificateKeyStorePassword})
-
-(def ^:private ssl-jdbc-derived-keys
-  (into #{:sslMode :verifyServerCertificate} ssl-jdbc-truststore-keys))
-
 (defn- ssl-enabled?
   "SSL is opt-in only: controlled by the Metabase \"Use a secure connection (SSL)\" checkbox."
   [{:keys [ssl]}]
@@ -176,17 +170,17 @@
              :trustCertificateKeyStoreUrl   (jks-truststore-file-url ssl-cert-pem)
              :trustCertificateKeyStorePassword ""))))
 
-(defn- reconcile-ssl-spec
-  "Align truststore and verifyServerCertificate with the effective sslMode after merging additional options."
+(defn- apply-ssl-spec
+  "Apply SSL JDBC properties once, honoring form settings, additional-options overrides, and sslMode-dependent keys."
   [spec ssl-cert-pem form-ssl-mode addl-spec]
   (let [effective-mode (or (some-> (:sslMode addl-spec) normalize-ssl-mode)
-                             (normalize-ssl-mode form-ssl-mode)
-                             (default-ssl-mode ssl-cert-pem))
+                           (normalize-ssl-mode form-ssl-mode)
+                           (default-ssl-mode ssl-cert-pem))
         derived-spec   (ssl-jdbc-spec ssl-cert-pem effective-mode)
         user-overrides (when addl-spec (select-keys addl-spec ssl-jdbc-property-keys))]
     (-> spec
-        (#(reduce dissoc % ssl-jdbc-derived-keys))
-        (merge (select-keys derived-spec ssl-jdbc-derived-keys))
+        (#(reduce dissoc % ssl-jdbc-property-keys))
+        (merge derived-spec)
         (merge user-overrides))))
 
 (defn- maybe-log-ssl-hint
@@ -201,8 +195,7 @@
       (when (= "false" (:verifyServerCertificate addl-opts-map))
         (log/warn "StarRocks SSL: verifyServerCertificate=false disables certificate validation."))
       (when (= "REQUIRED" effective-mode)
-        (log/warnf "StarRocks SSL: sslMode=REQUIRED encrypts but does not verify the server certificate."
-                   effective-mode))
+        (log/warn "StarRocks SSL: sslMode=REQUIRED encrypts but does not verify the server certificate."))
       (when (and (ssl-mode-verifies-certificate? effective-mode)
                  (not ssl-cert?)
                  (not (contains? addl-opts-map :trustCertificateKeyStoreUrl)))
@@ -254,8 +247,7 @@
                            :serverTimezone "UTC"
                            :allowPublicKeyRetrieval "true"
                            :zeroDateTimeBehavior "convertToNull"}
-                     (not ssl?) (assoc :useSSL "false")
-                     ssl?       (merge (ssl-jdbc-spec ssl-cert-pem ssl-mode)))
+                     (not ssl?) (assoc :useSSL "false"))
 
         addl-spec (when-let [opts (additional-options->keyword-map additional-options)]
                     (if ssl?
@@ -263,7 +255,7 @@
                       (without-ssl-jdbc-keys opts)))]
     (cond-> base-spec
       addl-spec (merge addl-spec)
-      ssl?      (#(reconcile-ssl-spec % ssl-cert-pem ssl-mode addl-spec)))))
+      ssl?      (#(apply-ssl-spec % ssl-cert-pem ssl-mode addl-spec)))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Type Mappings                                                          |
