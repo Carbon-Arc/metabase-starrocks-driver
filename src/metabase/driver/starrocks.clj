@@ -73,10 +73,32 @@
     :clientCertificateKeyStoreUrl :clientCertificateKeyStoreType :clientCertificateKeyStorePassword
     :enabledSslProtocolSuites :enabledSslCipherSuites})
 
+(def ^:private ssl-jdbc-truststore-keys
+  #{:trustCertificateKeyStoreUrl :trustCertificateKeyStoreType :trustCertificateKeyStorePassword})
+
+(def ^:private ssl-jdbc-derived-keys
+  (into #{:sslMode :verifyServerCertificate} ssl-jdbc-truststore-keys))
+
 (defn- ssl-enabled?
   "SSL is opt-in only: controlled by the Metabase \"Use a secure connection (SSL)\" checkbox."
   [{:keys [ssl]}]
   (boolean ssl))
+
+(defn- additional-opt-keyword
+  "Keywordize an additional-options key, matching SSL JDBC properties case-insensitively."
+  [k]
+  (or (some (fn [ssl-k]
+              (when (= (str/lower-case (name ssl-k))
+                       (str/lower-case k))
+                ssl-k))
+            ssl-jdbc-property-keys)
+      (keyword k)))
+
+(defn- additional-options->keyword-map
+  "Parse `additional-options` into a map with canonical keyword keys."
+  [additional-options]
+  (when-let [opts (additional-options->map additional-options)]
+    (into {} (map (fn [[k v]] [(additional-opt-keyword k) v]) opts))))
 
 (defn- without-ssl-jdbc-keys
   "Remove SSL-related keys so additional-options cannot enable SSL when the checkbox is off."
@@ -84,11 +106,13 @@
   (into {} (remove (fn [[k _]] (contains? ssl-jdbc-property-keys k)) opts-map)))
 
 (defn- valid-pem?
-  "True when `pem-content` looks like at least one PEM certificate block."
+  "True when `pem-content` contains at least one parseable PEM X.509 certificate."
   [pem-content]
   (boolean
    (and (not (str/blank? pem-content))
-        (re-find #"-----BEGIN CERTIFICATE-----" (str pem-content)))))
+        (try
+          (pos? (alength (parse-pem-certificates (str pem-content))))
+          (catch Exception _ false)))))
 
 (defn- parse-pem-certificates
   "Parse one or more PEM X.509 certificates from `pem-content`."
@@ -108,6 +132,8 @@
   [^String pem-content]
   (let [certs     (parse-pem-certificates pem-content)
         ^KeyStore ks (KeyStore/getInstance (KeyStore/getDefaultType))]
+    (when (zero? (alength certs))
+      (throw (IllegalArgumentException. "No parseable X.509 certificates in PEM content")))
     (.load ks nil nil)
     (dotimes [i (alength certs)]
       (.setCertificateEntry ks (str "ca-" i) (aget certs i)))
@@ -115,7 +141,7 @@
                               (.deleteOnExit))]
       (with-open [^FileOutputStream os (FileOutputStream. f)]
         (.store ks os (char-array "")))
-      (str "file:" (.getAbsolutePath f)))))
+      (.toString (.toURI f)))))
 
 (defn- normalize-ssl-mode
   "Normalize ssl-mode from the connection form (e.g. verify-identity -> VERIFY_IDENTITY)."
@@ -150,23 +176,36 @@
              :trustCertificateKeyStoreUrl   (jks-truststore-file-url ssl-cert-pem)
              :trustCertificateKeyStorePassword ""))))
 
+(defn- reconcile-ssl-spec
+  "Align truststore and verifyServerCertificate with the effective sslMode after merging additional options."
+  [spec ssl-cert-pem form-ssl-mode addl-spec]
+  (let [effective-mode (or (some-> (:sslMode addl-spec) normalize-ssl-mode)
+                             (normalize-ssl-mode form-ssl-mode)
+                             (default-ssl-mode ssl-cert-pem))
+        derived-spec   (ssl-jdbc-spec ssl-cert-pem effective-mode)
+        user-overrides (when addl-spec (select-keys addl-spec ssl-jdbc-property-keys))]
+    (-> spec
+        (#(reduce dissoc % ssl-jdbc-derived-keys))
+        (merge (select-keys derived-spec ssl-jdbc-derived-keys))
+        (merge user-overrides))))
+
 (defn- maybe-log-ssl-hint
   "Log SSL configuration hints when verification is enabled."
   [ssl? ssl-cert ssl-mode-from-form additional-options]
   (when ssl?
-    (let [addl-opts-map   (additional-options->map additional-options)
-          ssl-cert?       (and ssl-cert (not (str/blank? (str ssl-cert))))
+    (let [addl-opts-map   (additional-options->keyword-map additional-options)
+          ssl-cert?       (valid-pem? (str ssl-cert))
           form-ssl-mode   (normalize-ssl-mode ssl-mode-from-form)
-          addl-ssl-mode   (some-> (get addl-opts-map "sslMode") normalize-ssl-mode)
+          addl-ssl-mode   (some-> (:sslMode addl-opts-map) normalize-ssl-mode)
           effective-mode  (or addl-ssl-mode form-ssl-mode (default-ssl-mode (when ssl-cert? (str ssl-cert))))]
-      (when (= "false" (get addl-opts-map "verifyServerCertificate"))
+      (when (= "false" (:verifyServerCertificate addl-opts-map))
         (log/warn "StarRocks SSL: verifyServerCertificate=false disables certificate validation."))
       (when (= "REQUIRED" effective-mode)
         (log/warnf "StarRocks SSL: sslMode=REQUIRED encrypts but does not verify the server certificate."
                    effective-mode))
       (when (and (ssl-mode-verifies-certificate? effective-mode)
                  (not ssl-cert?)
-                 (not (contains? addl-opts-map "trustCertificateKeyStoreUrl")))
+                 (not (contains? addl-opts-map :trustCertificateKeyStoreUrl)))
         (log/infof "StarRocks SSL: sslMode=%s with JVM truststore. Paste the server CA PEM chain into 'Server SSL certificate chain' if you see PKIX / certificate_unknown errors."
                    effective-mode)))))
 
@@ -218,16 +257,13 @@
                      (not ssl?) (assoc :useSSL "false")
                      ssl?       (merge (ssl-jdbc-spec ssl-cert-pem ssl-mode)))
 
-        addl-spec (when-let [opts (additional-options->map additional-options)]
-                    (let [opts+keys (into {}
-                                          (map (fn [[k v]] [(keyword k) v]))
-                                          opts)]
-                      (if ssl?
-                        opts+keys
-                        (without-ssl-jdbc-keys opts+keys))))]
-    (if addl-spec
-      (merge base-spec addl-spec)
-      base-spec)))
+        addl-spec (when-let [opts (additional-options->keyword-map additional-options)]
+                    (if ssl?
+                      opts
+                      (without-ssl-jdbc-keys opts)))]
+    (cond-> base-spec
+      addl-spec (merge addl-spec)
+      ssl?      (#(reconcile-ssl-spec % ssl-cert-pem ssl-mode addl-spec)))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Type Mappings                                                          |
