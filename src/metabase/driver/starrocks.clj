@@ -247,6 +247,21 @@
 ;; Use MySQL-style quoting since StarRocks is MySQL-compatible
 (defmethod sql.qp/quote-style :starrocks [_] :mysql)
 
+;; Metabase 0.59+ adds ESCAPE '\' for literal LIKE patterns used by
+;; :contains/:starts-with/:ends-with filters. StarRocks does not parse explicit
+;; ESCAPE syntax here, while backslash escaping is already treated as built in.
+(defmethod sql.qp/transform-literal-like-pattern-honeysql :starrocks
+  [_driver like-rhs-honeysql]
+  like-rhs-honeysql)
+
+(prefer-method sql.qp/transform-literal-like-pattern-honeysql :starrocks :sql)
+
+;; /api/dataset/native prettification corrupts MySQL-style backtick identifiers
+;; for StarRocks, e.g. `silver`.`table`.`field` -> ` silver `.` table `.` field `.
+(defmethod driver/prettify-native-form :starrocks
+  [_driver native-form]
+  native-form)
+
 ;; Date/time handling
 (defmethod sql.qp/unix-timestamp->honeysql [:starrocks :seconds]
   [_ _ expr]
