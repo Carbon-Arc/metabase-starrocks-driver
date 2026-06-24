@@ -161,8 +161,6 @@
                            (default-ssl-mode ssl-cert-pem))
         use-custom-ca? (and (= ssl-mode "VERIFY_CA")
                             (valid-pem? ssl-cert-pem))]
-    (when (and (= ssl-mode "VERIFY_CA") ssl-cert-pem (not (valid-pem? ssl-cert-pem)))
-      (log/warn "StarRocks SSL: ssl-cert is set but does not contain a valid PEM certificate; using JVM truststore only."))
     (cond-> {:useSSL "true" :sslMode ssl-mode}
       (= ssl-mode "VERIFY_IDENTITY") (assoc :verifyServerCertificate "true")
       use-custom-ca?
@@ -196,8 +194,12 @@
         (log/warn "StarRocks SSL: verifyServerCertificate=false disables certificate validation."))
       (when (= "REQUIRED" effective-mode)
         (log/warn "StarRocks SSL: sslMode=REQUIRED encrypts but does not verify the server certificate."))
-      (when (and (ssl-mode-verifies-certificate? effective-mode)
+      (when (and (not (str/blank? (str ssl-cert)))
                  (not ssl-cert?)
+                 (ssl-mode-verifies-certificate? effective-mode))
+        (log/warn "StarRocks SSL: ssl-cert is set but does not contain a valid PEM certificate; using JVM truststore only."))
+      (when (and (ssl-mode-verifies-certificate? effective-mode)
+                 (str/blank? (str ssl-cert))
                  (not (contains? addl-opts-map :trustCertificateKeyStoreUrl)))
         (log/infof "StarRocks SSL: sslMode=%s with JVM truststore. Paste the server CA PEM chain into 'Server SSL certificate chain' if you see PKIX / certificate_unknown errors."
                    effective-mode)))))
