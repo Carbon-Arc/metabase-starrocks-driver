@@ -148,9 +148,9 @@
   (boolean (and ssl-mode (re-find #"VERIFY" ssl-mode))))
 
 (defn- default-ssl-mode
-  "Default sslMode when the form field is left empty."
-  [ssl-cert-pem]
-  (if ssl-cert-pem "VERIFY_CA" "VERIFY_IDENTITY"))
+  "Default sslMode when the form field is left empty (matches plugin default)."
+  []
+  "VERIFY_CA")
 
 (defn- ssl-jdbc-spec
   "Build JDBC SSL options from the ssl-mode form field and optional PEM trust material.
@@ -158,7 +158,7 @@
    and also checks that the certificate hostname matches the connection host."
   [ssl-cert-pem ssl-mode-from-form]
   (let [ssl-mode       (or (normalize-ssl-mode ssl-mode-from-form)
-                           (default-ssl-mode ssl-cert-pem))
+                           (default-ssl-mode))
         use-custom-ca? (and (= ssl-mode "VERIFY_CA")
                             (valid-pem? ssl-cert-pem))]
     (cond-> {:useSSL "true" :sslMode ssl-mode}
@@ -173,7 +173,7 @@
   [spec ssl-cert-pem form-ssl-mode addl-spec]
   (let [effective-mode (or (some-> (:sslMode addl-spec) normalize-ssl-mode)
                            (normalize-ssl-mode form-ssl-mode)
-                           (default-ssl-mode ssl-cert-pem))
+                           (default-ssl-mode))
         derived-spec   (ssl-jdbc-spec ssl-cert-pem effective-mode)
         user-overrides (when addl-spec (select-keys addl-spec ssl-jdbc-property-keys))]
     (-> spec
@@ -189,7 +189,7 @@
           ssl-cert?       (valid-pem? (str ssl-cert))
           form-ssl-mode   (normalize-ssl-mode ssl-mode-from-form)
           addl-ssl-mode   (some-> (:sslMode addl-opts-map) normalize-ssl-mode)
-          effective-mode  (or addl-ssl-mode form-ssl-mode (default-ssl-mode (when ssl-cert? (str ssl-cert))))]
+          effective-mode  (or addl-ssl-mode form-ssl-mode (default-ssl-mode))]
       (when (= "false" (:verifyServerCertificate addl-opts-map))
         (log/warn "StarRocks SSL: verifyServerCertificate=false disables certificate validation."))
       (when (= "REQUIRED" effective-mode)
