@@ -2,8 +2,8 @@
 
  :deps
  {org.clojure/clojure {:mvn/version "1.11.1"}
-  ;; MariaDB JDBC driver (MySQL compatible, used for StarRocks)
-  org.mariadb.jdbc/mariadb-java-client {:mvn/version "3.3.2"}}
+  ;; MySQL Connector/J — recommended by StarRocks for MySQL-protocol SSL (useSSL + verifyServerCertificate)
+  com.mysql/mysql-connector-j {:mvn/version "8.0.33"}}
 
  :aliases
  {:build
