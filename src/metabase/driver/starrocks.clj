@@ -235,10 +235,9 @@
                                (inc idx)))
                       (set fields)))})))))
 
-;;; The StarRocks JDBC doesn't support foreign keys
-(defmethod driver/describe-table-fks :starrocks
-  [_driver _database _table]
-  nil)
+;;; StarRocks doesn't support foreign keys. This is already declared above via
+;;; `:metadata/key-constraints false`, which is what Metabase gates FK metadata
+;;; fetching on, so no `describe-fks` implementation is needed here.
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Query Processing                                                       |
