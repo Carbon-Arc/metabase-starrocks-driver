@@ -17,7 +17,7 @@
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.util.log :as log])
   (:import
-   (java.sql Connection ResultSet)))
+   (java.sql Connection ResultSet ResultSetMetaData)))
 
 (set! *warn-on-reflection* true)
 
@@ -106,12 +106,20 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
 (def ^:private starrocks-type->base-type
-  "Map of StarRocks types to Metabase base types."
+  "Map of StarRocks types to Metabase base types.
+
+  Two naming schemes have to be covered here. Table sync reads the StarRocks
+  names from `information_schema.columns` (`varchar`, `int`), while result
+  columns are typed via `ResultSetMetaData.getColumnTypeName`, where the
+  MySQL wire protocol reports names such as `MEDIUMTEXT` or `INTEGER` for the
+  very same columns. A name that is missing here falls through to `:type/*`,
+  which makes result metadata disagree with the synced table metadata."
   (sql-jdbc.sync/pattern-based-database-type->base-type
    [[#"(?i)^boolean$"                  :type/Boolean]
     [#"(?i)^tinyint$"                  :type/Integer]
     [#"(?i)^smallint$"                 :type/Integer]
     [#"(?i)^int$"                      :type/Integer]
+    [#"(?i)^integer$"                  :type/Integer]
     [#"(?i)^bigint$"                   :type/BigInteger]
     [#"(?i)^largeint$"                 :type/BigInteger]
     [#"(?i)^float$"                    :type/Float]
@@ -121,6 +129,7 @@
     [#"(?i)^char.*"                    :type/Text]
     [#"(?i)^string$"                   :type/Text]
     [#"(?i)^text$"                     :type/Text]
+    [#"(?i)^(tiny|medium|long)text$"   :type/Text]
     [#"(?i)^json$"                     :type/JSON]
     [#"(?i)^date$"                     :type/Date]
     [#"(?i)^datetime$"                 :type/DateTime]
@@ -136,6 +145,23 @@
 (defmethod sql-jdbc.sync/database-type->base-type :starrocks
   [_ field-type]
   (starrocks-type->base-type field-type))
+
+(defmethod sql-jdbc.execute/column-metadata :starrocks
+  [driver ^ResultSetMetaData rsmeta]
+  ;; StarRocks BOOLEAN is stored as TINYINT(1) and reported as plain TINYINT over the MySQL
+  ;; wire protocol, while table sync reads it as `boolean` from DESCRIBE. Left alone, result
+  ;; columns come back as :type/Integer where the synced table says :type/Boolean, which
+  ;; breaks anything comparing the two - most visibly data sandboxing, whose column type
+  ;; check rejects every query against a sandboxed table. Real TINYINT columns report
+  ;; precision 4 and are left untouched.
+  (let [cols ((get-method sql-jdbc.execute/column-metadata :sql-jdbc) driver rsmeta)]
+    (into []
+          (map-indexed (fn [i col]
+                         (if (and (= "TINYINT" (:database_type col))
+                                  (= 1 (.getPrecision rsmeta (inc i))))
+                           (assoc col :base_type :type/Boolean, :database_type "BOOLEAN")
+                           col)))
+          cols)))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Metadata / Sync                                                        |
