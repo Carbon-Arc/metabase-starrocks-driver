@@ -1,7 +1,7 @@
 # Metabase StarRocks Driver
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Metabase](https://img.shields.io/badge/Metabase-v0.50+-blue.svg)](https://www.metabase.com/)
+[![Metabase](https://img.shields.io/badge/Metabase-v0.50--v0.63+-blue.svg)](https://www.metabase.com/)
 [![StarRocks](https://img.shields.io/badge/StarRocks-v3.2+-green.svg)](https://www.starrocks.io/)
 
 A community Metabase driver for [StarRocks](https://www.starrocks.io/) that fixes MySQL protocol compatibility issues and adds proper multi-catalog support.
@@ -58,9 +58,33 @@ Then restart Metabase to load the driver.
 
 ## Requirements
 
-- **Metabase**: v0.50+ (tested with v0.57)
+- **Metabase**: v0.50 through v0.63+ (see [Metabase version compatibility](#metabase-version-compatibility))
 - **StarRocks**: v3.2+ (for external catalog support)
 - **Java**: JDK 11-21 (for building from source)
+
+### Metabase version compatibility
+
+A single JAR supports every version in that range. Metabase adds and retires driver
+multimethods between releases, and this plugin ships Clojure *source* that the host compiles
+when it lazy-loads the driver — so a `defmethod` against a var the running Metabase does not
+have is a **compile-time** failure that takes the whole plugin down, not a degraded feature.
+
+Version-sensitive methods are therefore registered by **capability probe** at load time
+(`metabase.driver.starrocks.compat`): the multimethod is resolved at runtime and the
+implementation attached only if it exists. Probing is used rather than comparing version
+numbers because Metabase Enterprise reports `v1.x.y` where OSS reports `v0.x.y`, dev builds
+report `vLOCAL_DEV`, and additions can land in patch releases.
+
+| Multimethod | Present in | Notes |
+|---|---|---|
+| `driver/describe-table-fks` | 0.50–0.62 | Removed in 0.63 |
+| `driver/describe-fks` | 0.49+ | Replaces the above |
+| `driver/describe-database*` | 0.57+ | Preferred over `describe-database` where present. Metabase's own metadata says `:added "0.56.3"`, but the var is absent from `release-x.56.x` and first ships in `release-x.57.x` |
+| `sql.qp/transform-literal-like-pattern-honeysql` | 0.59+ | Before 0.59 Metabase does not add `ESCAPE '\'`, so no override is needed |
+
+To adapt to a future Metabase release, add a row to `version-sensitive-methods` in
+`src/metabase/driver/starrocks.clj`. `clojure -X:test` compiles the driver against a stub
+Metabase of each shape and fails if any version-sensitive var is referenced literally.
 
 ## Configuration
 

@@ -15,6 +15,7 @@
    [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
+   [metabase.driver.starrocks.compat :as compat]
    [metabase.util.log :as log])
   (:import
    (java.sql Connection ResultSet ResultSetMetaData)))
@@ -223,7 +224,9 @@
       (log/warnf "Could not get tables from schema %s: %s" schema (.getMessage e))
       [])))
 
-(defmethod driver/describe-database :starrocks
+;; Registered as `describe-database*` on Metabase 0.57+ and as `describe-database` on older
+;; versions -- see the compatibility matrix at the bottom of this namespace.
+(defn- describe-database-impl
   [driver database]
   (sql-jdbc.execute/do-with-connection-with-options
    driver
@@ -261,9 +264,9 @@
                                (inc idx)))
                       (set fields)))})))))
 
-;;; StarRocks doesn't support foreign keys. This is already declared above via
-;;; `:metadata/key-constraints false`, which is what Metabase gates FK metadata
-;;; fetching on, so no `describe-fks` implementation is needed here.
+;;; StarRocks has no foreign keys. The method that reports that moved between Metabase versions,
+;;; so it is registered from the compatibility matrix at the bottom of this namespace rather than
+;;; with a literal `defmethod`.
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                          Query Processing                                                       |
@@ -272,14 +275,9 @@
 ;; Use MySQL-style quoting since StarRocks is MySQL-compatible
 (defmethod sql.qp/quote-style :starrocks [_] :mysql)
 
-;; Metabase 0.59+ adds ESCAPE '\' for literal LIKE patterns used by
-;; :contains/:starts-with/:ends-with filters. StarRocks does not parse explicit
-;; ESCAPE syntax here, while backslash escaping is already treated as built in.
-(defmethod sql.qp/transform-literal-like-pattern-honeysql :starrocks
-  [_driver like-rhs-honeysql]
-  like-rhs-honeysql)
-
-(prefer-method sql.qp/transform-literal-like-pattern-honeysql :starrocks :sql)
+;; The LIKE-pattern override (Metabase 0.59+ only) is registered from the compatibility matrix at
+;; the bottom of this namespace -- `prefer-method` takes a compile-time var reference and is just
+;; as fatal as `defmethod` on versions that predate it.
 
 ;; /api/dataset/native prettification corrupts MySQL-style backtick identifiers
 ;; for StarRocks, e.g. `silver`.`table`.`field` -> ` silver `.` table `.` field `.
@@ -439,6 +437,72 @@
       
       (re-find #"(?i)unknown catalog" msg)
       "Catalog not found. Please check the catalog name."
-      
+
       :else
       msg)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                       Version Compatibility Matrix                                              |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;;; Methods whose multimethod is not present in every supported Metabase version. These CANNOT be
+;;; registered with a literal `defmethod`: that resolves the symbol at compile time, so one
+;;; missing var aborts this whole namespace and the plugin never loads. See
+;;; `metabase.driver.starrocks.compat` for the full reasoning.
+;;;
+;;; To adapt to a future Metabase release, add or amend a row here -- nothing else should need to
+;;; change. Adding a literal `defmethod` for a version-sensitive var will be caught by
+;;; `metabase.driver.starrocks.no-direct-refs-test`.
+
+(def ^:private version-sensitive-methods
+  [;; StarRocks has no foreign key constraints, so FK discovery is always empty.
+   ;;
+   ;; Which multimethod carries that answer depends on the version:
+   ;;   <= 0.48        describe-table-fks  (per table)
+   ;;   0.49 - 0.62    both exist; describe-fks preferred, describe-table-fks deprecated
+   ;;   >= 0.63        describe-fks only;  describe-table-fks REMOVED
+   ;;
+   ;; Both are registered where present. Metabase gates FK discovery on
+   ;; `:metadata/key-constraints` (0.50+) / `:foreign-keys` (<= 0.62), both declared false above,
+   ;; so in practice neither is called -- they exist so that :starrocks does not inherit
+   ;; :sql-jdbc's JDBC `getImportedKeys` implementation should that gate ever change.
+   {:mm    'metabase.driver/describe-table-fks
+    :impl  (fn describe-table-fks-starrocks [_driver _database _table] nil)
+    :group :foreign-keys}
+
+   ;; Variadic: 0.63 calls this with a trailing options *map*, older callers use kwargs.
+   {:mm    'metabase.driver/describe-fks
+    :impl  (fn describe-fks-starrocks [_driver _database & _options] [])
+    :group :foreign-keys}
+
+   ;; 0.57 split `describe-database` into a `describe-database*` impl wrapped by
+   ;; `do-with-resilient-connection`. (Metabase's own metadata says `:added "0.56.3"`, but the
+   ;; var is absent from release-x.56.x and first ships in release-x.57.x -- verified against
+   ;; both branches. Registration probes rather than compares versions, so the exact boundary
+   ;; only matters for humans reading this.)
+   ;; Implement the documented extension point wherever it exists.
+   {:mm    'metabase.driver/describe-database*
+    :impl  describe-database-impl
+    :group :describe-database}
+
+   ;; ...and fall back to the legacy name only on older versions. Registering both would put a
+   ;; direct `describe-database` method on :starrocks, shadowing the host's own wrapper and
+   ;; defeating the split.
+   {:mm     'metabase.driver/describe-database
+    :impl   describe-database-impl
+    :unless 'metabase.driver/describe-database*
+    :group  :describe-database}
+
+   ;; Metabase 0.59+ appends ESCAPE '\' to literal LIKE patterns used by
+   ;; :contains/:starts-with/:ends-with. StarRocks does not parse explicit ESCAPE syntax here,
+   ;; while backslash escaping is already treated as built in. Before 0.59 Metabase does not add
+   ;; the clause at all, so skipping this override on those versions is correct, not degraded.
+   {:mm     'metabase.driver.sql.query-processor/transform-literal-like-pattern-honeysql
+    :impl   (fn transform-literal-like-pattern-honeysql-starrocks [_driver like-rhs-honeysql]
+              like-rhs-honeysql)
+    :prefer :sql}])
+
+;; Performs the registration as a side effect of loading this namespace. `register-all!` logs
+;; what it did (and warns if a capability ended up with no implementation at all), so the return
+;; value is deliberately not bound -- an unread var would just be dead weight.
+(compat/register-all! :starrocks version-sensitive-methods)

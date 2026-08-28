@@ -8,4 +8,16 @@
  :aliases
  {:build
   {:deps {io.github.clojure/tools.build {:mvn/version "0.9.6"}}
-   :ns-default build}}}
+   :ns-default build}
+
+  ;; Test-only dependencies.
+  ;;
+  ;; `org.clojure/java.jdbc` is required by the driver but supplied by the Metabase host at
+  ;; runtime (Metabase's own deps.edn pins 0.7.12). It must NOT move into :deps -- `build.clj`'s
+  ;; `uber` task builds its basis from :deps and would bundle a second copy into the plugin JAR.
+  :test
+  {:extra-paths ["test" "test/stubs/common"]
+   :extra-deps  {org.clojure/java.jdbc                {:mvn/version "0.7.12"}
+                 io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :main-opts   ["-m" "cognitect.test-runner"]
+   :exec-fn     cognitect.test-runner.api/test}}}
