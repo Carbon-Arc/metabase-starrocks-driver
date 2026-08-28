@@ -1,0 +1,53 @@
+name: Test
+
+# Runs the test suite and the plugin build on every PR and on pushes to main.
+#
+# The release workflow only runs `clojure -T:build uber`, and it only runs once a
+# tag is already pushed — so before this workflow nothing verified a commit before
+# it shipped. That matters more than usual here: the suite compiles the driver
+# against stub Metabase hosts (v50/v57/v59/v63) to catch compile-time references
+# to multimethods that only exist in some versions, which is the failure mode
+# behind #10, #12 and #13. That guard is only worth having if it actually runs.
+#
+# Deliberately no `paths:` filter. If this is ever made a required check, a
+# filtered workflow that skips a PR leaves the check pending forever rather than
+# passing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Clojure CLI
+        uses: DeLaGuardo/setup-clojure@bc7570e912b028bbcc22f457adec7fdf98e2f4ed # 12.5
+        with:
+          cli: latest
+
+      - name: Run tests
+        run: clojure -M:test
+
+      # Same command the release workflow runs, so a build break surfaces here
+      # rather than after a tag is already pushed.
+      - name: Build JAR
+        run: clojure -T:build uber
