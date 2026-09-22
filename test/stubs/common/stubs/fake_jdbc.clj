@@ -20,6 +20,20 @@
       (^String getString [_ ^String label] (get (current) label))
       (close [_] nil))))
 
+(def executed-sql
+  "Every SQL string `connection` has been asked to run, in order.
+
+   Needed because asserting on what a driver method RETURNS cannot distinguish \"never asked\"
+   from \"asked and discarded\", and for anything that filters to save a round trip, that
+   distinction is the whole claim. `get-tables-in-schema` also swallows a failed `SHOW TABLES`
+   and returns `[]`, so omitting a canned answer does not surface the query either."
+  (atom []))
+
+(defn reset-executed-sql!
+  "Empties the log. Call it immediately before the driver method under test."
+  []
+  (reset! executed-sql []))
+
 (defn connection
   "A Connection whose statements answer from `sql->result`, a map of exact SQL string to
    `[columns rows]`. Unknown SQL throws, so a fixture drifting out of step with the driver's
@@ -29,6 +43,7 @@
     (createStatement [_]
       (reify Statement
         (executeQuery [_ sql]
+          (swap! executed-sql conj sql)
           (if-let [[columns rows] (get sql->result sql)]
             (result-set columns rows)
             (throw (ex-info (str "fake-jdbc: no canned result for SQL: " sql)

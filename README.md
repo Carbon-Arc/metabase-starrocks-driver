@@ -100,6 +100,7 @@ Metabase of each shape and fails if any version-sensitive var is referenced lite
 | Database | Database within catalog (optional) | `my_database` |
 | Username | StarRocks user | `admin` |
 | Password | User password | `••••••••` |
+| Schemas | Which databases in the catalog to sync | `sales_*, finance` |
 
 ### Catalog Examples
 
@@ -108,6 +109,16 @@ Metabase of each shape and fails if any version-sensitive var is referenced lite
 - **Iceberg/Polaris catalog**: `iceberg_catalog`
 
 > **Tip**: Leave the **Database** field empty to see all databases in the catalog.
+
+### Narrowing the sync
+
+Sync lists every database in the catalog and issues one `SHOW TABLES FROM` per database. On an
+internal catalog that is a handful of round trips. An external catalog can hold thousands, and the
+**Database** field does not help — the enumeration is catalog-scoped either way.
+
+**Schemas** cuts it down. It is Metabase's standard schema filter, the same control Snowflake,
+Redshift and SQL Server expose: leave it on **All**, or pick **Only these...** / **All except...**
+and give comma-separated names, `*` being the wildcard.
 
 ## Limitations
 

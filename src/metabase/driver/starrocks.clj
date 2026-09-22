@@ -16,6 +16,7 @@
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.starrocks.compat :as compat]
+   [metabase.driver.sync :as driver.s]
    [metabase.util.log :as log])
   (:import
    (java.sql Connection ResultSet ResultSetMetaData)))
@@ -194,18 +195,35 @@
   [_driver schema table]
   (str "DESCRIBE `" schema "`.`" table "`"))
 
+(defn- schema-filter-fn
+  "Returns a predicate over schema names, combining `excluded-schemas` with the operator's
+   `Schemas` filter -- the standard `:schema-filters` connection property Metabase already
+   renders for Snowflake, Redshift and SQL Server. Left on \"All\", `db-details->schema-filter-patterns`
+   returns `[nil nil]` and the predicate reduces to the `excluded-schemas` check alone, so the
+   default path is unchanged.
+
+   The caller must apply it before `describe-schema-sql`, not to the tables that come back: the
+   per-database `SHOW TABLES FROM` is the round trip being avoided, and an external catalog
+   answers `SHOW DATABASES` with thousands of databases."
+  [database]
+  (let [[inclusion-patterns exclusion-patterns]
+        (driver.s/db-details->schema-filter-patterns "schema-filters" database)]
+    (fn [schema-name]
+      (and (not (contains? excluded-schemas schema-name))
+           (driver.s/include-schema? inclusion-patterns exclusion-patterns schema-name)))))
+
 (defn- get-schemas
-  "Gets all schemas/databases in the current catalog."
-  [driver ^Connection conn]
+  "Gets the schemas/databases in the current catalog that `sync-schema-fn` admits."
+  [driver ^Connection conn sync-schema-fn]
   (with-open [stmt (.createStatement conn)]
     (let [sql (describe-catalog-sql driver)
           rs  (.executeQuery stmt sql)]
       (loop [schemas []]
         (if (.next ^ResultSet rs)
           (let [schema-name (.getString ^ResultSet rs 1)]
-            (recur (if (contains? excluded-schemas schema-name)
-                     schemas
-                     (conj schemas schema-name))))
+            (recur (if (sync-schema-fn schema-name)
+                     (conj schemas schema-name)
+                     schemas)))
           schemas)))))
 
 (defn- get-tables-in-schema
@@ -233,7 +251,7 @@
    database
    nil
    (fn [^Connection conn]
-     (let [schemas (get-schemas driver conn)
+     (let [schemas (get-schemas driver conn (schema-filter-fn database))
            tables  (into #{}
                          (mapcat (fn [schema]
                                    (get-tables-in-schema driver conn schema)))
