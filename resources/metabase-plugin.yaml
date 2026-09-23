@@ -26,6 +26,10 @@ driver:
       helper-text: "Specific database within the catalog. Leave empty to see all databases."
     - user
     - password
+    - name: schema-filters
+      type: schema-filters
+      display-name: Schemas
+      placeholder: "sales_*, finance"
     - ssh-tunnel
     - advanced-options-start
     - merge:

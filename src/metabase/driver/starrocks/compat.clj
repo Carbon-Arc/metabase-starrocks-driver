@@ -1,5 +1,6 @@
 (ns metabase.driver.starrocks.compat
-  "Version-portable multimethod registration.
+  "Version-portable multimethod registration, and the same fail-soft lookup for host functions
+   the driver calls rather than extends (`host-fn`).
 
    Metabase adds and retires driver multimethods between releases, and this plugin ships Clojure
    *source* that the host compiles when it lazy-loads the driver. A literal `defmethod` -- or
@@ -25,7 +26,7 @@
        the *second* component, so naive comparison misreads every EE install.
      - Dev builds report `vLOCAL_DEV`, with no number to parse.
      - Additions can land in patch releases.
-     - The version namespace itself moved to `metabase.config.core` in 0.63, so reading the
+     - The version namespace itself moved to `metabase.config.core` in 0.55, so reading the
        version is *itself* a version-sensitive dependency.
 
    Probing asks the only question that actually matters -- is this var here? -- and is immune to
@@ -42,9 +43,10 @@
      [:ok v]         the var exists
      [:no-var]       the namespace is loaded but has no such var -- the normal, expected
                      outcome for a method this Metabase version does not have
-     [:no-namespace] the namespace is not loaded at all -- almost always a maintainer error
-                     (a matrix row naming a namespace the driver never requires), not a
-                     version difference, so it must not be reported the same way"
+     [:no-namespace] the namespace is not loaded at all. For `register-method!` almost always
+                     a maintainer error (a matrix row naming a namespace the driver never
+                     requires), not a version difference, so it must not be reported the same
+                     way; for `host-fn` the designed outcome"
   [sym]
   (if-let [ns* (some-> (namespace sym) symbol find-ns)]
     (if-let [v (ns-resolve ns* (symbol (name sym)))]
@@ -60,6 +62,44 @@
     (when (= status :ok)
       (let [value (var-get v)]
         (when (instance? clojure.lang.MultiFn value)
+          value)))))
+
+(defn host-fn
+  "The function the running Metabase has at `sym`, or nil when the namespace or the var is
+   absent, or the var does not hold something callable (`ifn?` rather than `fn?`, so a host
+   function that has since become a multimethod still counts).
+
+   For host functions the driver CALLS, where `register-method!` is for host multimethods the
+   driver EXTENDS. The motive is the same. Naming the function directly -- its namespace in
+   `:require`, a qualified symbol at the call site -- resolves when the driver namespace is
+   compiled, so a host that has moved or renamed the namespace fails the whole load, and the
+   plugin is gone rather than one feature. The `{:added ...}` stability of a function protects its
+   signature, not its address: `metabase.config` became `metabase.config.core` in 0.55 with its
+   vars intact, and `metabase.plugins.classloader` became `metabase.classloader.core` in the same
+   period. The latter is why this uses `clojure.core/require` and not Metabase's own wrapper:
+   reaching the wrapper means naming *its* namespace, which has itself moved.
+
+   Unlike `register-method!`, a missing namespace is a legitimate outcome here and not a
+   maintainer error -- the caller has deliberately kept it out of the `:require` list -- so it is
+   not logged as one. The caller decides what to do without the function. Usually that is to keep
+   the behaviour the driver had before it started using it, and to say so in the log.
+
+   The namespace is `require`d (guarded) before the lookup rather than merely looked up, so the
+   answer does not depend on whether something else in the host happened to load it first. That
+   is safe: it is only the compile-time reference that `try` cannot protect, and this is runtime.
+   A caller that needs the answer once should hold it in a `delay`, which also serializes that
+   first `require`."
+  [sym]
+  (when-let [ns-sym (some-> (namespace sym) symbol)]
+    (try
+      (require ns-sym)
+      (catch Throwable t
+        (log/debugf "StarRocks: could not load %s (%s); falling back to whatever is already loaded"
+                    ns-sym (.getMessage t)))))
+  (let [[status v] (find-var* sym)]
+    (when (= status :ok)
+      (let [value (var-get v)]
+        (when (ifn? value)
           value)))))
 
 (defn register-method!

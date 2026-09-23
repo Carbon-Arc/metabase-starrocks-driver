@@ -13,6 +13,8 @@
 
 (def not-a-multifn 42)
 
+(defn sample-fn [x] (inc x))
+
 (def ^:private this-ns "metabase.driver.starrocks.compat-test")
 
 (defn- sym [n] (symbol this-ns n))
@@ -91,3 +93,22 @@
                        :unless (sym "no-such-multimethod")}])]
       (is (= #{(sym "sample-mm")} installed))
       (is (= :legacy (sample-mm ::f))))))
+
+(deftest host-fn-returns-the-function-when-present
+  (is (= 2 ((compat/host-fn (sym "sample-fn")) 1)))
+  (testing "loads the namespace itself rather than relying on something else having done so"
+    ;; Reset first so this also holds on a second run in the same JVM (a REPL): `require` leaves
+    ;; the lib in `*loaded-libs*`, and `remove-ns` alone would not make it load again.
+    (remove-ns 'stubs.lazy-host)
+    (dosync (alter @#'clojure.core/*loaded-libs* disj 'stubs.lazy-host))
+    (is (nil? (find-ns 'stubs.lazy-host))
+        "precondition: stubs.lazy-host must not be loaded before host-fn is asked for it")
+    (is (= :loaded ((compat/host-fn 'stubs.lazy-host/marker))))))
+
+(deftest host-fn-is-nil-when-absent
+  (testing "missing var"
+    (is (nil? (compat/host-fn (sym "no-such-fn")))))
+  (testing "missing namespace"
+    (is (nil? (compat/host-fn 'totally.absent.namespace/whatever))))
+  (testing "a var that exists but is not callable"
+    (is (nil? (compat/host-fn (sym "not-a-multifn"))))))

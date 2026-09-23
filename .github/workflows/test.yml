@@ -5,9 +5,10 @@ name: Test
 # The release workflow only runs `clojure -T:build uber`, and it only runs once a
 # tag is already pushed — so before this workflow nothing verified a commit before
 # it shipped. That matters more than usual here: the suite compiles the driver
-# against stub Metabase hosts (v50/v57/v59/v63) to catch compile-time references
-# to multimethods that only exist in some versions, which is the failure mode
-# behind #10, #12 and #13. That guard is only worth having if it actually runs.
+# against stub Metabase hosts (v50/v57/v59/v63, plus one lacking a namespace the
+# driver uses) to catch compile-time references to vars that only exist in some
+# versions, which is the failure mode behind #10, #12 and #13. That guard is only
+# worth having if it actually runs.
 #
 # Deliberately no `paths:` filter. If this is ever made a required check, a
 # filtered workflow that skips a PR leaves the check pending forever rather than
