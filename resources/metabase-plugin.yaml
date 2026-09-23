@@ -1,6 +1,6 @@
 info:
   name: Metabase StarRocks Driver
-  version: 1.0.0
+  version: 0.0.0-DEV
   description: StarRocks driver for Metabase with multi-catalog support.
 
 driver:
