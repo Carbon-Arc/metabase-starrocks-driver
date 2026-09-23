@@ -33,7 +33,12 @@ jobs:
         with:
           cli: latest
 
+      # VERSION is what the plugin reports in Metabase's plugin list; without it the build
+      # falls back to `git describe`, which on a tagged checkout is the same number but is not
+      # worth relying on here.
       - name: Build JAR
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
         run: clojure -T:build uber
 
       - name: Rename JAR with version
