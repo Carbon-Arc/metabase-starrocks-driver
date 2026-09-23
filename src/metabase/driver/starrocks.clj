@@ -16,7 +16,6 @@
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.starrocks.compat :as compat]
-   [metabase.driver.sync :as driver.s]
    [metabase.util.log :as log])
   (:import
    (java.sql Connection ResultSet ResultSetMetaData)))
@@ -195,22 +194,50 @@
   [_driver schema table]
   (str "DESCRIBE `" schema "`.`" table "`"))
 
+(def ^:private schema-filter-helpers
+  "The host's `db-details->schema-filter-patterns` and `include-schema?` as a map, or nil when
+   this Metabase has no usable pair. Resolved through `compat/host-fn` on first use, never
+   `:require`d: `metabase.driver.sync` is deliberately absent from this namespace's `:require`
+   list, because the filter is optional and the driver is not. A host that has moved or renamed
+   that namespace must cost the operator the Schemas setting, not the driver.
+
+   A `delay` rather than per-call resolution. A host cannot gain or lose a namespace while the
+   JVM runs, so the answer is a fact about the host, and so is the WARN below -- resolving per
+   call would repeat it on every sync of every database, including ones whose Schemas is left on
+   All. First use is the first `describe-database`, by which point the host's own sync code has
+   loaded the namespace; `host-fn` `require`s it regardless, and the delay serializes that."
+  (delay
+    (let [patterns-fn (compat/host-fn 'metabase.driver.sync/db-details->schema-filter-patterns)
+          include?    (compat/host-fn 'metabase.driver.sync/include-schema?)]
+      (if (and patterns-fn include?)
+        {:db-details->schema-filter-patterns patterns-fn
+         :include-schema?                    include?}
+        (do
+          (log/warnf (str "StarRocks: this Metabase has no metabase.driver.sync/"
+                          "db-details->schema-filter-patterns or include-schema?, so the Schemas "
+                          "connection setting is unavailable and sync behaves as if it were set to All"))
+          nil)))))
+
 (defn- schema-filter-fn
   "Returns a predicate over schema names, combining `excluded-schemas` with the operator's
    `Schemas` filter -- the standard `:schema-filters` connection property Metabase already
    renders for Snowflake, Redshift and SQL Server. Left on \"All\", `db-details->schema-filter-patterns`
    returns `[nil nil]` and the predicate reduces to the `excluded-schemas` check alone, so the
-   default path is unchanged.
+   default path is unchanged. Without the host helpers (see `schema-filter-helpers`) it is that
+   check alone as well -- sync exactly as it was before the filter existed.
 
    The caller must apply it before `describe-schema-sql`, not to the tables that come back: the
    per-database `SHOW TABLES FROM` is the round trip being avoided, and an external catalog
    answers `SHOW DATABASES` with thousands of databases."
   [database]
-  (let [[inclusion-patterns exclusion-patterns]
-        (driver.s/db-details->schema-filter-patterns "schema-filters" database)]
-    (fn [schema-name]
-      (and (not (contains? excluded-schemas schema-name))
-           (driver.s/include-schema? inclusion-patterns exclusion-patterns schema-name)))))
+  (let [not-system? #(not (contains? excluded-schemas %))]
+    (if-let [{:keys [db-details->schema-filter-patterns include-schema?]} @schema-filter-helpers]
+      (let [[inclusion-patterns exclusion-patterns]
+            (db-details->schema-filter-patterns "schema-filters" database)]
+        (fn [schema-name]
+          (and (not-system? schema-name)
+               (include-schema? inclusion-patterns exclusion-patterns schema-name))))
+      not-system?)))
 
 (defn- get-schemas
   "Gets the schemas/databases in the current catalog that `sync-schema-fn` admits."

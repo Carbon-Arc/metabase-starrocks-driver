@@ -23,7 +23,7 @@
 (defn- driver-prop-name
   "The literal the driver passes to `db-details->schema-filter-patterns`."
   []
-  (second (re-find #"db-details->schema-filter-patterns\s+\"([^\"]+)\""
+  (second (re-find #"\(db-details->schema-filter-patterns\s+\"([^\"]+)\""
                    (slurp (tc/repo-file "src" "metabase" "driver" "starrocks.clj")))))
 
 (deftest manifest-and-driver-agree-on-the-schema-filter-property-name

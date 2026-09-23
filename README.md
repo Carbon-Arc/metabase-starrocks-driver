@@ -120,6 +120,12 @@ internal catalog that is a handful of round trips. An external catalog can hold 
 Redshift and SQL Server expose: leave it on **All**, or pick **Only these...** / **All except...**
 and give comma-separated names, `*` being the wildcard.
 
+The filter is optional in a stronger sense too. On a Metabase build that lacks the helpers it is
+built on, the driver still loads: the setting is ignored, a warning is logged, and sync behaves as
+if it were set to **All**. No release from 0.50 to 0.63 lacks them, so this is insurance against a
+future rename; the line to look for in the log begins
+`StarRocks: this Metabase has no metabase.driver.sync/`.
+
 ## Limitations
 
 - Foreign key relationships are not supported (StarRocks limitation)
