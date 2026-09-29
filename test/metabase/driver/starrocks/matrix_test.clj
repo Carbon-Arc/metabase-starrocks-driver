@@ -42,13 +42,35 @@
                               (catch Throwable t#
                                 {:err (str (.getName (class t#)) ": " (.getMessage t#))}))
                             :absent))
-           db#          {:id 1 :name "test"}
+           db#          {:id 1 :name "test" :details {:catalog "default_catalog"}}
            ;; Same catalog and the same canned answers; only the Schemas filter differs.
            schemas-db#  (fn [type# patterns#]
                           {:id 2
                            :name "filtered"
-                           :details {:schema-filters-type     type#
+                           :details {:catalog                 "default_catalog"
+                                     :schema-filters-type     type#
                                      :schema-filters-patterns patterns#}})
+           ;; No catalog at all -- the connection spans every catalog it can see. Metabase submits a
+           ;; cleared optional text field as "", not nil, so blank is the shape this actually
+           ;; arrives in; `{}` only covers a connection saved before the property existed.
+           all-db#      {:id 4 :name "all-catalogs" :details {}}
+           blank-db#    {:id 5 :name "blank-catalog" :details {:catalog "   "}}
+           all-sql#     {"SHOW CATALOGS"
+                         [["Catalog"]  [{"Catalog" "default_catalog"}
+                                        {"Catalog" "hive_catalog"}
+                                        ;; visible but unusable -- no canned answer, so listing it
+                                        ;; throws and must be survived rather than abort the sync
+                                        {"Catalog" "unreachable_catalog"}]]
+                         "SHOW DATABASES FROM `default_catalog`"
+                         [["Database"] [{"Database" "sales_kr"} {"Database" "information_schema"}]]
+                         "SHOW DATABASES FROM `hive_catalog`"
+                         [["Database"] [{"Database" "sales_hive"} {"Database" "information_schema"}]]
+                         "SHOW TABLES FROM `default_catalog`.`sales_kr`"
+                         [["Tables"]   [{"Tables" "mv_daily_totals"}]]
+                         "SHOW TABLES FROM `hive_catalog`.`sales_hive`"
+                         [["Tables"]   [{"Tables" "orders"}]]
+                         "DESCRIBE `hive_catalog`.`sales_hive`.`orders`"
+                         [["Field" "Type"] [{"Field" "order_id" "Type" "bigint"}]]}
            ;; Returns both what sync got back AND every SQL the driver ran, because the point of
            ;; filtering in `get-schemas` is a query that is never issued -- invisible in the result.
            describe-db# (fn [dbx# sql-results#]
@@ -65,6 +87,15 @@
                                ;; Lets the degrade path's log contract be asserted: a WARN without
                                ;; the host functions, none with them.
                                :warns @(var-get (resolve 'metabase.util.log/warnings))})))
+           ;; A honeysql identifier as the host builds it: `[::identifier type [component ...]]`.
+           ;; Written out rather than made with `h2x/identifier` because no stub provides that
+           ;; function -- the driver does not call it, and a stub in `test/stubs/common` would only
+           ;; prove that every shape resolves the same stub. The layout is the host's public
+           ;; `Identifier` schema, identical from 0.50 through 0.63.
+           ident#       (fn [t# & cs#]
+                          [:metabase.util.honey-sql-2/identifier t# (vec cs#)])
+           to-hsql#     (fn [x#]
+                          (call# 'metabase.driver.sql.query-processor/->honeysql [:starrocks x#]))
            filter-sql#  {"SHOW DATABASES"              [["Database"] [{"Database" "sales_kr"}
                                                                       {"Database" "scratch"}
                                                                       {"Database" "information_schema"}]]
@@ -146,7 +177,50 @@
          ;; `schema-filter-fn` are in tension: `excluded-schemas` has to win, as it does in
          ;; Metabase's own `filtered-syncable-schemas`. `scratch` is not a system database, so the
          ;; wildcard correctly keeps it.
-         :filter-wildcard  (describe-db# (schemas-db# "inclusion" "*") filter-sql#)}))))
+         :filter-wildcard  (describe-db# (schemas-db# "inclusion" "*") filter-sql#)
+
+         ;; With no catalog pinned, `SHOW CATALOGS` drives the enumeration and every schema name
+         ;; carries its catalog. Each catalog has its own `information_schema`, so the system-database
+         ;; check has to look at the database part rather than the composed name.
+         :all-catalogs     (describe-db# all-db# all-sql#)
+         :blank-catalog    (describe-db# blank-db# all-sql#)
+
+         ;; `describe-table` builds its own SQL from the schema and was changed by the same commit;
+         ;; nothing else in the suite reaches it.
+         :describe-table
+         (with-bindings
+           {(resolve 'metabase.driver.sql-jdbc.execute/*sql-results*) all-sql#}
+           (call# 'metabase.driver/describe-table
+                  [:starrocks all-db# {:schema "hive_catalog.sales_hive" :name "orders"}]))
+
+         ;; Metabase quotes a schema as ONE identifier. A `catalog.database` schema has to come back
+         ;; apart in BOTH places it appears -- the FROM clause and every qualified column reference.
+         :identifiers
+         {:field-multi  (to-hsql# (ident# :field "hive_catalog.sales_hive" "orders" "order_id"))
+          :table-multi  (to-hsql# (ident# :table "hive_catalog.sales_hive" "orders"))
+          :table-single (to-hsql# (ident# :table "sales_kr" "mv_daily_totals"))
+          :alias-left-alone (to-hsql# (ident# :field-alias "not.a.schema"))
+
+          ;; A joined table or saved question contributes its display name as the alias, and that
+          ;; name is free text a user can edit. Two components mean there is no schema here at all.
+          :join-alias       (to-hsql# (ident# :field "Revenue v1.2" "amount"))
+
+          ;; 0.63 may prepend a `:db` component to a table identifier, which pushes the schema off
+          ;; index 0. Counting from the end is what survives that.
+          :table-with-db    (to-hsql# (ident# :table "somedb" "hive_catalog.sales_hive" "orders"))
+
+          ;; Only the schema position is eligible. A dot anywhere else is data, not structure.
+          :dotted-tail      (to-hsql# (ident# :field "sales_hive" "orders" "weird.col"))
+          :alias-multi      (to-hsql# (ident# :field-alias "a.b" "c"))
+          :field-single     (to-hsql# (ident# :field "a.b"))
+
+          ;; Metabase hangs a column's database type off the identifier as metadata, and the
+          ;; rewrite builds a new vector. `prn` drops metadata, so it is read off in this JVM.
+          :meta-kept        (some-> (to-hsql# (with-meta (ident# :field "hive_catalog.sales_hive"
+                                                                 "orders" "order_id")
+                                                {:database-type "bigint"}))
+                                    :ok
+                                    meta)}}))))
 
 (defn- run-shape*
   "Load the driver in a fresh JVM against `shape`'s stub Metabase; return the probe result."
@@ -340,6 +414,71 @@
         (doseq [[probe-key [expected _]] (filter-cases schema-filter?)]
           (testing (name probe-key)
             (is (= expected (:call (probe-key result))))))))))
+
+(def ^:private both-catalogs
+  {:ok {:tables #{{:name "mv_daily_totals" :schema "default_catalog.sales_kr"}
+                  {:name "orders"          :schema "hive_catalog.sales_hive"}}}})
+
+(deftest spans-every-catalog-when-none-is-pinned
+  (doseq [[shape {:keys [desc]}] (sort shapes)]
+    (testing (str shape " (" desc ")")
+      (let [result             (probe! shape)
+            {:keys [call sql]} (:all-catalogs result)]
+        (testing "schemas are composed as catalog.database"
+          (is (= both-catalogs call)))
+        (testing "every catalog's own information_schema is dropped"
+          (is (not (some #(re-find #"information_schema" %) sql))
+              "excluded-schemas must match the database part, not the composed name"))
+        (testing "a catalog that cannot be listed is survived, not fatal"
+          (is (some #{"SHOW DATABASES FROM `unreachable_catalog`"} sql)
+              "the fixture must actually attempt the catalog that has no canned answer"))
+        (testing "a blank Catalog is the same as an absent one -- Metabase submits \"\" for a cleared field"
+          (is (= both-catalogs (:call (:blank-catalog result)))))))))
+
+(deftest describe-table-qualifies-the-catalog
+  (doseq [[shape {:keys [desc]}] (sort shapes)]
+    (testing (str shape " (" desc ")")
+      (is (= {:ok {:schema "hive_catalog.sales_hive"
+                   :name   "orders"
+                   :fields #{{:name              "order_id"
+                              :database-type     "bigint"
+                              :base-type         :type/BigInteger
+                              :database-position 0}}}}
+             (:describe-table (probe! shape)))
+          "DESCRIBE has to split the schema too, or it asks for a database that does not exist"))))
+
+(deftest identifiers-split-the-catalog-back-out
+  (doseq [[shape {:keys [desc]}] (sort shapes)]
+    (testing (str shape " (" desc ")")
+      (let [ids  (:identifiers (probe! shape))
+            tag  :metabase.util.honey-sql-2/identifier]
+        (testing "the rewrite preserves the tag and the identifier type"
+          (is (= [tag :field] (take 2 (:ok (:field-multi ids)))))
+          (is (= [tag :table] (take 2 (:ok (:table-multi ids))))))
+        (testing "a qualified column reference, which is where fixing only the table falls short"
+          (is (= ["hive_catalog" "sales_hive" "orders" "order_id"]
+                 (last (:ok (:field-multi ids))))))
+        (testing "the FROM clause"
+          (is (= ["hive_catalog" "sales_hive" "orders"]
+                 (last (:ok (:table-multi ids))))))
+        (testing "a pinned connection is untouched"
+          (is (= ["sales_kr" "mv_daily_totals"]
+                 (last (:ok (:table-single ids))))))
+        (testing "an alias is never split, whatever it contains"
+          (is (= ["not.a.schema"] (last (:ok (:alias-left-alone ids))))))
+        (testing "a two-component field is a join alias, not a schema -- splitting it breaks the query"
+          (is (= ["Revenue v1.2" "amount"] (last (:ok (:join-alias ids))))))
+        (testing "the schema is found from the end, so a leading :db component does not hide it"
+          (is (= ["somedb" "hive_catalog" "sales_hive" "orders"]
+                 (last (:ok (:table-with-db ids))))))
+        (testing "a dot outside the schema position is data, not structure"
+          (is (= ["sales_hive" "orders" "weird.col"] (last (:ok (:dotted-tail ids))))))
+        (testing "the type guard, not the arity guard, is what protects a multi-part alias"
+          (is (= ["a.b" "c"] (last (:ok (:alias-multi ids))))))
+        (testing "a lone component carries no schema"
+          (is (= ["a.b"] (last (:ok (:field-single ids))))))
+        (testing "the rewrite keeps the identifier's metadata, which carries the column's database type"
+          (is (= {:database-type "bigint"} (:meta-kept ids))))))))
 
 (deftest schema-filter-runs-before-show-tables
   (testing "a filtered-out database is never queried, not merely dropped from the result"

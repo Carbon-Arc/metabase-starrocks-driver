@@ -6,6 +6,19 @@
 (defmulti quote-style
   (fn [driver] driver))
 
+;;; Dispatches the way the host does for the two shapes the driver cares about: an h2x identifier
+;;; vector dispatches on its `::identifier` tag, a metadata map on its `:lib/type`.
+(defmulti ->honeysql
+  (fn [driver x]
+    [driver (cond
+              (and (vector? x) (= :metabase.util.honey-sql-2/identifier (first x)))
+              :metabase.util.honey-sql-2/identifier
+
+              (map? x) (:lib/type x x)
+              :else    (type x))]))
+
+(defmethod ->honeysql :default [_driver x] x)
+
 (defmulti unix-timestamp->honeysql
   (fn [driver unit _expr] [driver unit]))
 

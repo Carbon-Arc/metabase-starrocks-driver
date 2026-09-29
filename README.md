@@ -96,25 +96,51 @@ Metabase of each shape and fails if any version-sensitive var is referenced lite
 |-------|-------------|---------|
 | Host | StarRocks FE hostname | `starrocks-fe.example.com` |
 | Port | MySQL protocol port | `9030` |
-| Catalog | StarRocks catalog name | `default_catalog` |
-| Database | Database within catalog (optional) | `my_database` |
+| Catalog | One StarRocks catalog, or empty for all of them (optional) | `default_catalog` |
+| Database | Database within the catalog (optional) | `my_database` |
 | Username | StarRocks user | `admin` |
 | Password | User password | `••••••••` |
-| Schemas | Which databases in the catalog to sync | `sales_*, finance` |
+| Schemas | Which databases to sync | `sales_*, finance` |
 
 ### Catalog Examples
 
 - **Internal catalog**: `default_catalog`
 - **Hive catalog**: `hive_catalog`
 - **Iceberg/Polaris catalog**: `iceberg_catalog`
+- **Every catalog**: leave the field empty (see [One connection, every catalog](#one-connection-every-catalog))
 
 > **Tip**: Leave the **Database** field empty to see all databases in the catalog.
 
+### One connection, every catalog
+
+With **Catalog** filled in, a connection sees that one catalog and its databases appear in
+Metabase as schemas, exactly as before. A cluster with several external catalogs then needs one
+connection per catalog, and Metabase cannot join across its own database entries — a question can
+never span two catalogs.
+
+Leave **Catalog** empty and the connection spans every catalog the account can see. Sync runs
+`SHOW CATALOGS` and lists the databases of each; every Metabase schema is then named
+`catalog.database` (`hive_catalog.sales`, `default_catalog.finance`), and the generated SQL
+qualifies each table with its catalog, so a query — or a query-builder join — can reach two
+catalogs at once.
+
+Two things follow from the composed name:
+
+- **Schemas** matches against `catalog.database`, so one pattern narrows both:
+  `hive_catalog.sales_*` syncs the matching databases of that catalog and nothing from the others.
+- A catalog whose databases cannot be listed (its metastore is down, say) is logged as an error
+  and skipped; the other catalogs still sync. Catalogs the account holds no privilege on never
+  appear in `SHOW CATALOGS`, so they are not attempted at all.
+
+Naming a catalog is not deprecated. It is the right choice when one catalog is all a connection
+should see, and it costs one round trip fewer per sync.
+
 ### Narrowing the sync
 
-Sync lists every database in the catalog and issues one `SHOW TABLES FROM` per database. On an
-internal catalog that is a handful of round trips. An external catalog can hold thousands, and the
-**Database** field does not help — the enumeration is catalog-scoped either way.
+Sync lists every database in the catalog (or, with **Catalog** empty, in every catalog) and issues
+one `SHOW TABLES FROM` per database. On an internal catalog that is a handful of round trips. An
+external catalog can hold thousands, and the **Database** field does not help — the enumeration is
+catalog-scoped either way.
 
 **Schemas** cuts it down. It is Metabase's standard schema filter, the same control Snowflake,
 Redshift and SQL Server expose: leave it on **All**, or pick **Only these...** / **All except...**
@@ -181,7 +207,7 @@ This triggers a workflow that builds the JAR and creates a GitHub release with t
 
 ### Tables Not Showing
 
-- Verify the catalog name is correct
+- Verify the catalog name is correct, or leave **Catalog** empty to sync every catalog
 - Check that the user has `SELECT` privileges on the tables
 - Try leaving the Database field empty to scan all databases
 
