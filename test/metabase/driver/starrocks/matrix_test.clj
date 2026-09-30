@@ -32,6 +32,7 @@
      (require 'metabase.driver.starrocks)
      (require 'metabase.driver.sql-jdbc.execute)
      (require 'stubs.fake-jdbc)
+     (require 'metabase.query-processor.store)
      (let [probe#       (fn [s#] (some-> (namespace s#) symbol find-ns (ns-resolve (symbol (name s#)))))
            registered#  (fn [s#] (when-let [v# (probe# s#)]
                                    (contains? (methods (var-get v#)) :starrocks)))
@@ -94,8 +95,39 @@
            ;; `Identifier` schema, identical from 0.50 through 0.63.
            ident#       (fn [t# & cs#]
                           [:metabase.util.honey-sql-2/identifier t# (vec cs#)])
-           to-hsql#     (fn [x#]
-                          (call# 'metabase.driver.sql.query-processor/->honeysql [:starrocks x#]))
+           ;; `->honeysql` asks the QP store which database the query is for, so each call runs as
+           ;; if inside a query on `dbx#` -- or, with nil, outside any query.
+           to-hsql-on#  (fn [dbx# x#]
+                          (with-bindings
+                            {(resolve 'metabase.query-processor.store/*metadata-provider*)
+                             (when dbx# {:database dbx#})}
+                            (call# 'metabase.driver.sql.query-processor/->honeysql [:starrocks x#])))
+           to-hsql#     (fn [x#] (to-hsql-on# all-db# x#))
+           ;; Pinned to an external catalog whose database names contain dots, the way an Iceberg
+           ;; REST catalog shows a nested namespace. `ns.information_schema` ends in a system
+           ;; database's name and must still sync: on a pinned connection it is a single database,
+           ;; not the `information_schema` of a catalog called `ns`.
+           iceberg-db#  {:id 6 :name "iceberg-pinned" :details {:catalog "iceberg_catalog"}}
+           dotted-sql#  {"SHOW DATABASES"
+                         [["Database"] [{"Database" "a.b"}
+                                        {"Database" "ns.information_schema"}
+                                        {"Database" "information_schema"}]]
+                         "SHOW TABLES FROM `a.b`"
+                         [["Tables"]   [{"Tables" "t"}]]
+                         "SHOW TABLES FROM `ns.information_schema`"
+                         [["Tables"]   [{"Tables" "u"}]]
+                         "DESCRIBE `a.b`.`t`"
+                         [["Field" "Type"] [{"Field" "c" "Type" "int"}]]}
+           ;; The same nested namespace reached through an unpinned connection, where the driver
+           ;; composes `iceberg_catalog.a.b` and has to split it at its own dot, not the database's.
+           nested-sql#  {"SHOW CATALOGS"
+                         [["Catalog"]  [{"Catalog" "iceberg_catalog"}]]
+                         "SHOW DATABASES FROM `iceberg_catalog`"
+                         [["Database"] [{"Database" "a.b"}]]
+                         "SHOW TABLES FROM `iceberg_catalog`.`a.b`"
+                         [["Tables"]   [{"Tables" "t"}]]
+                         "DESCRIBE `iceberg_catalog`.`a.b`.`t`"
+                         [["Field" "Type"] [{"Field" "c" "Type" "int"}]]}
            filter-sql#  {"SHOW DATABASES"              [["Database"] [{"Database" "sales_kr"}
                                                                       {"Database" "scratch"}
                                                                       {"Database" "information_schema"}]]
@@ -185,6 +217,21 @@
          :all-catalogs     (describe-db# all-db# all-sql#)
          :blank-catalog    (describe-db# blank-db# all-sql#)
 
+         ;; A pinned connection must send every database name whole, dots and all.
+         :pinned-dotted    (describe-db# iceberg-db# dotted-sql#)
+         :pinned-dotted-table
+         (with-bindings
+           {(resolve 'metabase.driver.sql-jdbc.execute/*sql-results*) dotted-sql#}
+           (call# 'metabase.driver/describe-table
+                  [:starrocks iceberg-db# {:schema "a.b" :name "t"}]))
+
+         :unpinned-nested  (describe-db# all-db# nested-sql#)
+         :unpinned-nested-table
+         (with-bindings
+           {(resolve 'metabase.driver.sql-jdbc.execute/*sql-results*) nested-sql#}
+           (call# 'metabase.driver/describe-table
+                  [:starrocks all-db# {:schema "iceberg_catalog.a.b" :name "t"}]))
+
          ;; `describe-table` builds its own SQL from the schema and was changed by the same commit;
          ;; nothing else in the suite reaches it.
          :describe-table
@@ -213,6 +260,18 @@
           :dotted-tail      (to-hsql# (ident# :field "sales_hive" "orders" "weird.col"))
           :alias-multi      (to-hsql# (ident# :field-alias "a.b" "c"))
           :field-single     (to-hsql# (ident# :field "a.b"))
+
+          ;; The same dotted schema on a pinned connection is one database, in FROM and in SELECT.
+          :pinned-table     (to-hsql-on# iceberg-db# (ident# :table "a.b" "t"))
+          :pinned-field     (to-hsql-on# iceberg-db# (ident# :field "a.b" "t" "c"))
+          ;; No query in progress, so no way to tell which connection this is: leave it whole.
+          :no-query         (to-hsql-on# nil (ident# :table "hive_catalog.sales_hive" "orders"))
+          ;; The metadata provider may leave `:details` out; that is not the same as a blank Catalog.
+          :no-details       (to-hsql-on# {:id 7 :name "no-details"}
+                                         (ident# :table "hive_catalog.sales_hive" "orders"))
+          ;; Unpinned, only the first dot is the driver's; any later dot belongs to the database name.
+          :nested-table     (to-hsql# (ident# :table "iceberg_catalog.a.b" "t"))
+          :nested-field     (to-hsql# (ident# :field "iceberg_catalog.a.b" "t" "c"))
 
           ;; Metabase hangs a column's database type off the identifier as metadata, and the
           ;; rewrite builds a new vector. `prn` drops metadata, so it is read off in this JVM.
@@ -461,7 +520,7 @@
         (testing "the FROM clause"
           (is (= ["hive_catalog" "sales_hive" "orders"]
                  (last (:ok (:table-multi ids))))))
-        (testing "a pinned connection is untouched"
+        (testing "a schema with no dot is untouched"
           (is (= ["sales_kr" "mv_daily_totals"]
                  (last (:ok (:table-single ids))))))
         (testing "an alias is never split, whatever it contains"
@@ -479,6 +538,47 @@
           (is (= ["a.b"] (last (:ok (:field-single ids))))))
         (testing "the rewrite keeps the identifier's metadata, which carries the column's database type"
           (is (= {:database-type "bigint"} (:meta-kept ids))))))))
+
+(deftest pinned-connection-never-splits-a-database-name
+  (doseq [[shape {:keys [desc]}] (sort shapes)]
+    (testing (str shape " (" desc ")")
+      (let [result             (probe! shape)
+            {:keys [call sql]} (:pinned-dotted result)
+            ids                (:identifiers result)]
+        (testing "sync lists each dotted name as a single database"
+          (is (= {:ok {:tables #{{:name "t" :schema "a.b"}
+                                 {:name "u" :schema "ns.information_schema"}}}}
+                 call))
+          (is (some #{"SHOW TABLES FROM `a.b`"} sql)
+              "if split, this becomes `a`.`b` and StarRocks reads `a` as the catalog"))
+        (testing "a database whose name merely ends in information_schema is not a system database"
+          (is (some #{"SHOW TABLES FROM `ns.information_schema`"} sql)))
+        (testing "DESCRIBE keeps the database whole"
+          (is (= "a.b" (get-in result [:pinned-dotted-table :ok :schema])))
+          (is (= #{"c"} (into #{} (map :name) (get-in result [:pinned-dotted-table :ok :fields])))))
+        (testing "query identifiers keep the database whole, in FROM and in SELECT"
+          (is (= ["a.b" "t"] (last (:ok (:pinned-table ids)))))
+          (is (= ["a.b" "t" "c"] (last (:ok (:pinned-field ids))))))
+        (testing "outside a query, nothing is split"
+          (is (= ["hive_catalog.sales_hive" "orders"] (last (:ok (:no-query ids))))))
+        (testing "a database with no :details is not mistaken for one with a blank Catalog"
+          (is (= ["hive_catalog.sales_hive" "orders"] (last (:ok (:no-details ids))))))))))
+
+(deftest unpinned-connection-splits-only-at-the-catalog-dot
+  (doseq [[shape {:keys [desc]}] (sort shapes)]
+    (testing (str shape " (" desc ")")
+      (let [result             (probe! shape)
+            {:keys [call sql]} (:unpinned-nested result)
+            ids                (:identifiers result)]
+        (testing "sync composes the schema with the catalog and keeps the database whole"
+          (is (= {:ok {:tables #{{:name "t" :schema "iceberg_catalog.a.b"}}}} call))
+          (is (some #{"SHOW TABLES FROM `iceberg_catalog`.`a.b`"} sql)
+              "splitting at the last dot would ask catalog `iceberg_catalog.a` for database `b`"))
+        (testing "DESCRIBE splits at the same dot"
+          (is (= #{"c"} (into #{} (map :name) (get-in result [:unpinned-nested-table :ok :fields])))))
+        (testing "query identifiers split at the same dot, in FROM and in SELECT"
+          (is (= ["iceberg_catalog" "a.b" "t"] (last (:ok (:nested-table ids)))))
+          (is (= ["iceberg_catalog" "a.b" "t" "c"] (last (:ok (:nested-field ids))))))))))
 
 (deftest schema-filter-runs-before-show-tables
   (testing "a filtered-out database is never queried, not merely dropped from the result"

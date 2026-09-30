@@ -23,7 +23,7 @@ driver:
     - name: dbname
       display-name: Database (optional)
       required: false
-      helper-text: "Specific database within the catalog. Leave empty to see all databases."
+      helper-text: "Specific database within the catalog. Leave empty to see all databases. Ignored when Catalog is empty."
     - user
     - password
     - name: schema-filters

@@ -97,7 +97,7 @@ Metabase of each shape and fails if any version-sensitive var is referenced lite
 | Host | StarRocks FE hostname | `starrocks-fe.example.com` |
 | Port | MySQL protocol port | `9030` |
 | Catalog | One StarRocks catalog, or empty for all of them (optional) | `default_catalog` |
-| Database | Database within the catalog (optional) | `my_database` |
+| Database | Database within the catalog (optional; ignored when Catalog is empty) | `my_database` |
 | Username | StarRocks user | `admin` |
 | Password | User password | `••••••••` |
 | Schemas | Which databases to sync | `sales_*, finance` |
@@ -124,13 +124,25 @@ Leave **Catalog** empty and the connection spans every catalog the account can s
 qualifies each table with its catalog, so a query — or a query-builder join — can reach two
 catalogs at once.
 
-Two things follow from the composed name:
+What changes when **Catalog** is empty:
 
 - **Schemas** matches against `catalog.database`, so one pattern narrows both:
   `hive_catalog.sales_*` syncs the matching databases of that catalog and nothing from the others.
 - A catalog whose databases cannot be listed (its metastore is down, say) is logged as an error
   and skipped; the other catalogs still sync. Catalogs the account holds no privilege on never
   appear in `SHOW CATALOGS`, so they are not attempted at all.
+- **Switch between one catalog and every catalog by adding a new connection, not by editing
+  Catalog on an existing one.** Clearing **Catalog** renames every schema (`sales` becomes
+  `default_catalog.sales`), and filling it in renames them back. Metabase treats a renamed schema
+  as a different one: it retires the tables under the old names, and the saved questions and
+  dashboards built on them break.
+- **Database** does nothing while the **Catalog** field is empty. The connection opens on
+  `default_catalog.information_schema` whatever **Database** says, and sync walks every catalog.
+- A connection whose details have no `catalog` key at all also spans every catalog. The admin form
+  cannot produce one from an existing connection, because **Catalog** was required in earlier
+  releases, so only connections created through the API need checking. Unlike one with **Catalog**
+  cleared, such a connection opens on `default_catalog.<Database>` when **Database** is set, but
+  sync still walks every catalog.
 
 Naming a catalog is not deprecated. It is the right choice when one catalog is all a connection
 should see, and it costs one round trip fewer per sync.
