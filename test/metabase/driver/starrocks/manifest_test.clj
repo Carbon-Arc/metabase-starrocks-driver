@@ -26,6 +26,34 @@
   (second (re-find #"\(db-details->schema-filter-patterns\s+\"([^\"]+)\""
                    (slurp (tc/repo-file "src" "metabase" "driver" "starrocks.clj")))))
 
+(defn- manifest-catalog-block
+  "The `catalog` connection property's block in the manifest, from its `- name: catalog` line to
+   the next line at the same indent."
+  []
+  ;; Group 2 is the block. Group 1 is the indent, captured only so the block's lines can be
+   ;; matched against it -- taking `second` here would silently return the whitespace and make
+   ;; every assertion below pass against nothing.
+  (nth (re-find #"(?m)^(\s+)- name: catalog\s*$\n((?:\1  .*\n)+)"
+                (slurp (tc/repo-file "resources" "metabase-plugin.yaml")))
+       2 nil))
+
+(deftest catalog-property-stays-optional
+  (testing "the multi-catalog path exists only because an operator can submit an empty Catalog"
+    (let [block (manifest-catalog-block)]
+      (is (some? block) "no `- name: catalog` property found in the manifest")
+      (is (not (re-find #"required:\s*true" (str block)))
+          "making Catalog required again removes the only way to reach the multi-catalog path, and
+           no runtime test can see it -- every fixture builds :details by hand"))))
+
+(deftest manifest-and-driver-agree-on-the-catalog-property-name
+  (testing "`pinned-catalog` reads `[:details :catalog]` literally"
+    (is (re-find #"(?m)^\s+- name: catalog\s*$"
+                 (slurp (tc/repo-file "resources" "metabase-plugin.yaml")))
+        "renaming the manifest property silently unpins every connection")
+    (is (re-find #"\[:details :catalog\]"
+                 (slurp (tc/repo-file "src" "metabase" "driver" "starrocks.clj")))
+        "the driver must still read the key the manifest declares")))
+
 (deftest manifest-and-driver-agree-on-the-schema-filter-property-name
   (testing "both sides were found, so two nils cannot pass this by matching each other"
     (is (some? (manifest-prop-name))

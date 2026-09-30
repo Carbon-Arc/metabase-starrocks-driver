@@ -179,20 +179,52 @@
   ;; Return nil to skip privilege checking - StarRocks handles permissions differently
   nil)
 
+(defn- pinned-catalog
+  "The catalog this connection is pinned to, or nil to span every catalog the account can see."
+  [database]
+  (let [catalog (some-> (get-in database [:details :catalog]) str/trim)]
+    (when-not (str/blank? catalog)
+      catalog)))
+
+(defn- split-schema
+  "Splits a Metabase schema name back into StarRocks' `[catalog database]`.
+
+   StarRocks has three levels -- catalog, database, table -- and Metabase has two. When the
+   connection is not pinned to one catalog, the driver composes the Metabase schema as
+   `catalog.database`, and the first dot is the one it added. On a pinned connection the schema is
+   the database name exactly as StarRocks reported it, so it is never split: a database name in the
+   internal catalog cannot contain a dot, but one in an external catalog can -- an Iceberg REST
+   catalog shows a nested namespace as `a.b` -- and splitting it would turn `a` into a catalog."
+  [pinned? schema]
+  (let [schema (str schema)]
+    (if-let [i (when-not pinned? (str/index-of schema "."))]
+      [(subs schema 0 i) (subs schema (inc i))]
+      [nil schema])))
+
+(defn- qualify
+  "Backtick-quoted identifier for the parts given, skipping the nils."
+  [& parts]
+  (str/join "." (for [p parts :when (some? p)] (str "`" p "`"))))
+
 (defn- describe-catalog-sql
-  "The SHOW DATABASES statement that will list all schemas/databases for the current catalog."
-  [_driver]
-  "SHOW DATABASES")
+  "The SHOW DATABASES statement listing the databases of `catalog`, or of the connection's own
+   catalog when `catalog` is nil."
+  [_driver catalog]
+  (if catalog
+    (str "SHOW DATABASES FROM " (qualify catalog))
+    "SHOW DATABASES"))
 
 (defn- describe-schema-sql
   "The SHOW TABLES statement that will list all tables for the given schema/database."
-  [_driver schema]
-  (str "SHOW TABLES FROM `" schema "`"))
+  [_driver pinned? schema]
+  (let [[catalog db] (split-schema pinned? schema)]
+    (str "SHOW TABLES FROM " (qualify catalog db))))
 
 (defn- describe-table-sql
   "The DESCRIBE statement that will list information about the given table."
-  [_driver schema table]
-  (str "DESCRIBE `" schema "`.`" table "`"))
+  [_driver pinned? schema table]
+  (let [[catalog db] (split-schema pinned? schema)]
+    (str "DESCRIBE " (qualify catalog db table))))
 
 (def ^:private schema-filter-helpers
   "The host's `db-details->schema-filter-patterns` and `include-schema?` as a map, or nil when
@@ -230,7 +262,13 @@
    per-database `SHOW TABLES FROM` is the round trip being avoided, and an external catalog
    answers `SHOW DATABASES` with thousands of databases."
   [database]
-  (let [not-system? #(not (contains? excluded-schemas %))]
+  (let [pinned?     (some? (pinned-catalog database))
+        ;; The system databases are matched on the database part alone: every catalog has its own
+        ;; `information_schema`, and an unpinned connection composes the schema as
+        ;; `catalog.database`. The operator's patterns see the whole composed name, so
+        ;; `hive_catalog.sales_*` narrows catalog and database in one field.
+        not-system? (fn [schema-name]
+                      (not (contains? excluded-schemas (second (split-schema pinned? schema-name)))))]
     (if-let [{:keys [db-details->schema-filter-patterns include-schema?]} @schema-filter-helpers]
       (let [[inclusion-patterns exclusion-patterns]
             (db-details->schema-filter-patterns "schema-filters" database)]
@@ -239,26 +277,47 @@
                (include-schema? inclusion-patterns exclusion-patterns schema-name))))
       not-system?)))
 
-(defn- get-schemas
-  "Gets the schemas/databases in the current catalog that `sync-schema-fn` admits."
-  [driver ^Connection conn sync-schema-fn]
+(defn- first-column
+  "Every value in column 1 of `sql`'s result, in order."
+  [^Connection conn sql]
   (with-open [stmt (.createStatement conn)]
-    (let [sql (describe-catalog-sql driver)
-          rs  (.executeQuery stmt sql)]
-      (loop [schemas []]
+    (let [rs (.executeQuery stmt sql)]
+      (loop [acc []]
         (if (.next ^ResultSet rs)
-          (let [schema-name (.getString ^ResultSet rs 1)]
-            (recur (if (sync-schema-fn schema-name)
-                     (conj schemas schema-name)
-                     schemas)))
-          schemas)))))
+          (recur (conj acc (.getString ^ResultSet rs 1)))
+          acc)))))
+
+(defn- get-schemas
+  "Schema names to sync, already composed the way Metabase will store them.
+
+   Pinned to one catalog, these are bare database names and nothing about the existing behaviour
+   changes. Unpinned, `SHOW CATALOGS` drives the enumeration and each name carries its catalog."
+  [driver ^Connection conn database sync-schema-fn]
+  (let [catalogs (if (pinned-catalog database)
+                   [nil]                                    ; nil = the connection's own catalog
+                   (first-column conn "SHOW CATALOGS"))]
+    (into []
+          (comp (mapcat (fn [catalog]
+                          (try
+                            (for [db (first-column conn (describe-catalog-sql driver catalog))]
+                              (if catalog (str catalog "." db) db))
+                            (catch Exception e
+                              ;; Louder than the per-schema warning on purpose: an empty list here
+                              ;; is indistinguishable from "this catalog has no databases", and
+                              ;; Metabase retires the tables it synced last time, breaking saved
+                              ;; questions until a later sync succeeds.
+                              (log/errorf "Could not list databases in catalog %s, so none of its tables will sync: %s"
+                                          catalog (.getMessage e))
+                              []))))
+                (filter sync-schema-fn))
+          catalogs)))
 
 (defn- get-tables-in-schema
   "Gets all tables in the given schema/database."
-  [driver ^Connection conn schema]
+  [driver ^Connection conn pinned? schema]
   (try
     (with-open [stmt (.createStatement conn)]
-      (let [sql (describe-schema-sql driver schema)
+      (let [sql (describe-schema-sql driver pinned? schema)
             rs  (.executeQuery stmt sql)]
         (loop [tables []]
           (if (.next ^ResultSet rs)
@@ -278,10 +337,11 @@
    database
    nil
    (fn [^Connection conn]
-     (let [schemas (get-schemas driver conn (schema-filter-fn database))
+     (let [pinned? (some? (pinned-catalog database))
+           schemas (get-schemas driver conn database (schema-filter-fn database))
            tables  (into #{}
                          (mapcat (fn [schema]
-                                   (get-tables-in-schema driver conn schema)))
+                                   (get-tables-in-schema driver conn pinned? schema)))
                          schemas)]
        {:tables tables}))))
 
@@ -293,7 +353,7 @@
    nil
    (fn [^Connection conn]
      (with-open [stmt (.createStatement conn)]
-       (let [sql (describe-table-sql driver schema table-name)
+       (let [sql (describe-table-sql driver (some? (pinned-catalog database)) schema table-name)
              rs  (.executeQuery stmt sql)]
          {:schema schema
           :name   table-name
@@ -319,6 +379,106 @@
 
 ;; Use MySQL-style quoting since StarRocks is MySQL-compatible
 (defmethod sql.qp/quote-style :starrocks [_] :mysql)
+
+;;; Metabase quotes each identifier component whole, so a `catalog.database` schema comes out as
+;;; `` `hive_catalog.some_db` `` -- not a database StarRocks has. It wants
+;;; `` `hive_catalog`.`some_db` ``.
+;;;
+;;; Rewriting at the identifier level rather than at `:metadata/table` covers both places a schema
+;;; appears: the FROM clause and every qualified column reference in SELECT. Fixing only the table
+;;; produces a query whose FROM is right and whose column references are still wrong.
+;;;
+;;; Only the schema component is split, only for identifiers that can carry a schema, and only when
+;;; the query runs on a connection with no catalog pinned -- the one case where the driver composed
+;;; the schema itself. A pinned connection's schema is the database name as StarRocks reported it,
+;;; and an external catalog's database name can contain a dot, so it is always left whole. Nothing
+;;; `->honeysql` receives says which connection the query is for, so `query-spans-catalogs?` asks
+;;; the host; see `qp-database-helpers` for why that is a runtime lookup.
+;;;
+;;; Nothing here names `metabase.util.honey-sql-2`. The dispatch value is a literal keyword, and
+;;; the identifier is rebuilt with `assoc` rather than through `h2x/identifier`, so the driver
+;;; does not `:require` the namespace for a feature that is optional -- the same reasoning as
+;;; `schema-filter-helpers`, without needing a runtime lookup. The layout being relied on,
+;;; `[::identifier type [component ...]]`, is the namespace's public `Identifier` schema, unchanged
+;;; from 0.50 through 0.63, and the method's own argument destructuring depends on it already;
+;;; `assoc` adds no assumption that the destructuring did not make first. `assoc` on a vector
+;;; keeps its metadata, which Metabase uses to carry a column's database type on an identifier.
+(defn- schema-component-index
+  "Where the schema sits in `components`, or nil when this identifier carries none.
+
+   Keying on position rather than on index 0 is what keeps the rewrite off identifiers that merely
+   start with something dotted:
+
+     :table  [schema table]                  -- schema is second from last, and 0.63 may prepend a
+             [db schema table]                  `:db` component, so counting from the end is the
+                                                only stable answer
+     :field  [schema table column]           -- schema leads
+             [schema table parent... column] -- still leads
+             [join-alias column]             -- NO schema. The alias is a joined table's or saved
+                                                question's display name, which users edit freely;
+                                                `Revenue v1.2` in position 0 would otherwise be
+                                                split into two identifiers and the query would fail
+             [source-query-alias column]     -- NO schema, same shape"
+  [identifier-type components]
+  (let [n (count components)]
+    (case identifier-type
+      :table (when (>= n 2) (- n 2))
+      :field (when (>= n 3) 0)
+      nil)))
+
+(def ^:private qp-database-helpers
+  "The host functions that look up the database of the query being compiled, as a map, or nil when
+   this Metabase has no usable set. Resolved through `compat/host-fn` rather than `:require`d, for
+   the reason `schema-filter-helpers` gives: the multi-catalog rewrite is optional and the driver
+   is not. `metabase.query-processor.store` and `metabase.lib.metadata` keep these names and
+   arities from 0.50 through 0.63.
+
+   Without them the rewrite is off. Falling back to off keeps every pinned connection exactly as it
+   was and costs only unpinned connections, whose queries then fail loudly on
+   `` `catalog.database` ``, whereas falling back to on would silently break pinned connections
+   with dotted database names."
+  (delay
+    (let [initialized? (compat/host-fn 'metabase.query-processor.store/initialized?)
+          provider     (compat/host-fn 'metabase.query-processor.store/metadata-provider)
+          database     (compat/host-fn 'metabase.lib.metadata/database)]
+      (if (and initialized? provider database)
+        {:initialized?      initialized?
+         :metadata-provider provider
+         :database          database}
+        (do
+          (log/warnf (str "StarRocks: this Metabase lacks "
+                          "metabase.query-processor.store/initialized?, "
+                          "metabase.query-processor.store/metadata-provider or "
+                          "metabase.lib.metadata/database, so a connection with Catalog left empty "
+                          "cannot qualify its tables with their catalog and its queries will fail"))
+          nil)))))
+
+(defn- query-spans-catalogs?
+  "True when the query being compiled runs on a connection with no catalog pinned. False when that
+   cannot be determined -- no host helpers, no query in progress, or a database whose `:details` the
+   metadata provider left out (the host schema marks them optional); a false answer leaves
+   identifiers whole."
+  []
+  (if-let [{:keys [initialized? metadata-provider database]} @qp-database-helpers]
+    (and (initialized?)
+         (let [db (database (metadata-provider))]
+           (and (map? (:details db))
+                (nil? (pinned-catalog db)))))
+    false))
+
+(defmethod sql.qp/->honeysql [:starrocks :metabase.util.honey-sql-2/identifier]
+  [_driver [_tag identifier-type components :as identifier]]
+  (let [i (schema-component-index identifier-type components)]
+    ;; The dot check comes first so that the host lookup runs only for a schema that could need it.
+    (if (and i
+             (str/includes? (str (nth components i)) ".")
+             (query-spans-catalogs?))
+      (let [[catalog db] (split-schema false (nth components i))]
+        (assoc identifier 2 (-> []
+                                (into (take i components))
+                                (conj catalog db)
+                                (into (drop (inc i) components)))))
+      identifier)))
 
 ;; The LIKE-pattern override (Metabase 0.59+ only) is registered from the compatibility matrix at
 ;; the bottom of this namespace -- `prefer-method` takes a compile-time var reference and is just

@@ -17,13 +17,13 @@ driver:
         - dbname
         - name: catalog
           placeholder: default_catalog
-          display-name: Catalog
-          required: true
-          helper-text: "StarRocks catalog name (e.g., 'default_catalog' for internal, or your external catalog name like 'hive_catalog')"
+          display-name: Catalog (optional)
+          required: false
+          helper-text: "One StarRocks catalog, e.g. 'default_catalog' for internal tables or 'hive_catalog' for an external one. Leave empty to sync every catalog the account can see; schemas are then named catalog.database."
     - name: dbname
       display-name: Database (optional)
       required: false
-      helper-text: "Specific database within the catalog. Leave empty to see all databases."
+      helper-text: "Specific database within the catalog. Leave empty to see all databases. Ignored when Catalog is empty."
     - user
     - password
     - name: schema-filters
